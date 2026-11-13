@@ -80,7 +80,7 @@ test('input-output row and Context Router Worker row use DSH views', () => {
   assert.match(app, /DSH 对话与轨迹组件未加载/);
   assert.equal((html.match(/<form id="submit-form"[\s\S]*?<\/form>/)[0].match(/<button\b/g) || []).length, 1);
   assert.doesNotMatch(html, /interact-button|data-preset/);
-  assert.match(html, /id="submit-button"[^>]*disabled>confirm</);
+  assert.match(html, /id="submit-button"[^>]*disabled>口述指令</);
   assert.ok(html.indexOf('id="submit-button"') < html.indexOf('id="esc-button"'));
   assert.match(html, /id="inform_stream"[^>]*readonly/);
   assert.doesNotMatch(html + app, /🔘/);
@@ -138,8 +138,8 @@ test('output shows the router dialogue, streamed text, then the committed exchan
   assert.match(html, /id="agent-panel"[^>]*aria-label="agent panel"/);
   assert.match(html, /aria-label="function panel"/);
   assert.match(html, /aria-label="command panel"/);
-  assert.match(html, /id="esc-button"[^>]*>esc</);
-  assert.match(css, /\.esc-button \{[^}]*width:calc\(34px \* 19\.5 \/ 24\)/);
+  assert.match(html, /id="esc-button"[^>]*>关闭功能面板</);
+  assert.doesNotMatch(css, /\.esc-button \{[^}]*width:/);
   assert.match(css, /\.function-panel \{[^}]*transform:translateX\(100%\)/);
   assert.match(css, /\.output-stage\.is-split \.function-panel \{[^}]*transform:translateX\(0\)/);
   assert.match(css, /\.command-shell \{[^}]*transform:translateY\(calc\(100% \+ 24px\)\)/);
@@ -157,7 +157,8 @@ test('all element bindings exist and secrets are never refilled from public conf
   assert.match(html, /type="password"/);
 });
 test('network operations are backend-only and submit requires model configuration', () => {
-  for (const path of ['/api/model/config', '/api/state', '/api/events', '/api/submit', '/api/interaction']) assert.ok(app.includes("'" + path + "'"));
+  for (const path of ['/api/model/config', '/api/state', '/api/events', '/api/voice/interaction', '/api/interaction']) assert.ok(app.includes("'" + path + "'"));
+  assert.doesNotMatch(app, /\/api\/submit/);
   assert.match(app, /config\?\.configured === true/);
   assert.match(app, /addEventListener\('data', receive\)/);
   assert.match(app, /不会切换为模拟模型/);
@@ -171,11 +172,11 @@ test('voice mode locks text entry and routes all capture controls through backen
   value.sound2text.capture.status = 'listening';
   assert.equal(ui.interactionRequest(value, '', 'running').path, '/api/voice/interaction');
   value.subtitle.active = true;
-  assert.deepEqual(plain(ui.interactionRequest(value, '不应发送', 'running')), { path: '/api/interaction', body: {} });
+  assert.deepEqual(plain(ui.interactionRequest(value, '不应发送', 'running')), { path: '/api/voice/interaction', body: {} });
   value.subtitle.active = false; value.sound2text.status = 'stopped';
   assert.equal(ui.audioState(value).readOnly, false);
-  assert.deepEqual(plain(ui.interactionRequest(value, '新指令')), { path: '/api/submit', body: { instruction: '新指令' } });
-  assert.deepEqual(plain(ui.interactionRequest(value, '')), { path: '/api/interaction', body: { intent: 'interrupt' } });
+  assert.throws(() => ui.interactionRequest(value, '新指令'), /语音输入/);
+  assert.throws(() => ui.interactionRequest(value, ''), /语音输入/);
 });
 test('microphone uses SVG playback controls and dedicated PCM worklet resources', () => {
   assert.match(html, /id="audio-toggle"/); assert.match(html, /class="play-symbol"/); assert.match(html, /class="pause-symbol"/);
@@ -198,7 +199,8 @@ test('speaker card owns the output and close button bypasses text and voice capt
   value.busy = true; value.stream = { text: 'Router confirmation' };
   assert.equal(ui.functionPanel(value).kind, 'speaker');
   assert.equal(ui.outputContent(value).text, 'Router confirmation');
-  assert.deepEqual(plain(ui.interactionRequest(value, '识别面前说话人', 'running')), { path: '/api/interaction', body: {} });
+  value.sound2text = { status: 'running', capture: { status: 'idle' } };
+  assert.deepEqual(plain(ui.interactionRequest(value, '识别面前说话人', 'running')), { path: '/api/voice/interaction', body: {} });
   assert.equal(ui.validateState(value), value);
   assert.throws(() => ui.validateState({ ...value, speaker: { active: true, person: { name: 'missing fields' } } }), /说话人状态/);
   value.speaker.active = false;

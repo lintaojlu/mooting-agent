@@ -97,9 +97,9 @@ try {
   asr.recognize({ text: '现在显示修订后的识别结果', start: activationTime + 10, end: activationTime + 200, definite: true });
   await cdp.until(`document.querySelector('#function-text').textContent.includes('修订后的识别结果')`);
   assert.equal(await cdp.evaluate(`document.querySelector('#submit-form').closest('section').querySelectorAll('button').length`), 3);
-  assert.equal(await cdp.evaluate(`(() => { const disc = parseFloat(getComputedStyle(document.querySelector('#audio-toggle'), '::before').height); const play = document.querySelector('#audio-toggle').getBoundingClientRect(); const esc = document.querySelector('#esc-button').getBoundingClientRect(); const confirm = document.querySelector('#submit-button'); const box = confirm.getBoundingClientRect(); return play.right <= box.left && box.right <= esc.left && Math.abs(esc.height - disc) <= 1 && Math.abs(esc.width - disc) <= 1 && Math.abs(box.height - disc) <= 1 && confirm.textContent === 'confirm'; })()`), true);
+  assert.equal(await cdp.evaluate(`(() => { const disc = parseFloat(getComputedStyle(document.querySelector('#audio-toggle'), '::before').height); const play = document.querySelector('#audio-toggle').getBoundingClientRect(); const esc = document.querySelector('#esc-button').getBoundingClientRect(); const dictate = document.querySelector('#submit-button'); const box = dictate.getBoundingClientRect(); return play.right <= box.left && box.right <= esc.left && Math.abs(esc.height - disc) <= 1 && Math.abs(box.height - disc) <= 1 && dictate.textContent === '口述指令' && esc.textContent === '关闭功能面板'; })()`), true);
   const inputCountBeforeStop = submitted.trace.filter(event => event.type === 'interaction.submitted').length;
-  await cdp.evaluate(`document.querySelector('#submit-button').click()`);
+  await cdp.evaluate(`document.querySelector('#esc-button').click()`);
   await cdp.until(`!document.querySelector('#display-mode').textContent.includes('字幕') && !document.querySelector('#output-stage').classList.contains('is-split')`);
   const stopped = await readState();
   assert.equal(stopped.trace.filter(event => event.type === 'interaction.submitted').length, inputCountBeforeStop);
@@ -161,7 +161,8 @@ try {
   assert.equal(await cdp.evaluate(`document.querySelector('#speaker-identity').textContent`), '空间折叠负责人；AI创业者');
   assert.deepEqual(await cdp.evaluate(`[...document.querySelectorAll('#speaker-notes li')].map(item => item.textContent)`), ['上次聊过如何构建高时效性的AgentOS。', '对于新AI终端的出现坚定不移。', '创立了一家人文科技公司“空间折叠”。']);
   assert.equal(await cdp.evaluate(`document.querySelector('#speaker-card').textContent.includes('模拟数据') || document.querySelector('#speaker-card').textContent.includes('按 esc')`), false);
-  assert.equal(await cdp.evaluate(`document.querySelector('#submit-button').getAttribute('aria-label')`), '关闭说话人识别');
+  assert.equal(await cdp.evaluate(`document.querySelector('#submit-button').getAttribute('aria-label')`), '口述指令');
+  assert.equal(await cdp.evaluate(`document.querySelector('#esc-button').textContent`), '关闭功能面板');
   assert.equal(await cdp.evaluate(`document.querySelector('#output-text').hidden`), false);
   assert.equal(await cdp.evaluate(`document.querySelector('#output-stage').classList.contains('is-split')`), true);
   const speakerState = await readState();

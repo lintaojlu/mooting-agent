@@ -94,7 +94,10 @@ export class Sound2Text {
   }
   checkpoint(value) {
     const boundary = value === undefined ? this.audioMs : value;
-    if (!Number.isFinite(boundary) || boundary < 0 || Math.abs(boundary - this.audioMs) > 400) throw new Error('音频按钮时间边界无效或与音频流不同步');
+    const ahead = boundary - this.audioMs;
+    // Confirm travels over HTTP while PCM is still in flight on the audio socket.
+    // Past audio is limited to the 400ms lookback; future audio may be the whole upload budget.
+    if (!Number.isFinite(boundary) || boundary < 0 || ahead < -400 || ahead > 8000) throw new Error('音频按钮时间边界无效或与音频流不同步');
     return boundary;
   }
   observeVoice(buffer, startMs, boundaryMs, endMs) {
@@ -139,30 +142,46 @@ export class Sound2Text {
     if (!this.capture.heardSpeech && cutoffMs <= this.audioMs) { this.cancelCapture('没有有效语音，未提交指令'); return { ...this.capture }; }
     this.capture = { ...this.capture, status: 'finishing', endMs: this.capture.lastVoiceMs, cutoffMs, reason };
     this.events.emit('capture', { ...this.capture }); this.changed();
-    this.finalTimer = setTimeout(() => this.cancelCapture('识别未完成，请重试'), this.config.finalWaitMs);
+    const lag = Math.max(0, cutoffMs - this.audioMs);
+    this.finalTimer = setTimeout(() => this.expireCapture(), lag + this.config.finalWaitMs);
     this.tryFinalize(); return { ...this.capture };
   }
-  tryFinalize() {
-    const capture = this.capture; if (capture.status !== 'finishing' || this.audioMs < capture.cutoffMs) return;
-    if (!capture.heardSpeech) { this.cancelCapture('没有有效语音，未提交指令'); return; }
+  commandText(capture, { allowGap = false } = {}) {
+    if (this.audioMs < capture.cutoffMs) return { wait: true };
+    if (!capture.heardSpeech) return { cancel: '没有有效语音，未提交指令' };
     capture.endMs = Math.min(capture.lastVoiceMs, capture.cutoffMs);
     const relevant = this.utterances.filter(u => u.end_time > capture.boundaryMs && u.start_time <= capture.endMs);
-    if (!relevant.length || relevant.some(u => !u.definite)) return;
-    if (Math.max(...relevant.map(u => u.end_time)) + 100 < capture.endMs) return;
+    if (!relevant.length || relevant.some(u => !u.definite)) return { wait: true };
+    if (!allowGap && Math.max(...relevant.map(u => u.end_time)) + 100 < capture.endMs) return { wait: true };
     const parts = [];
     for (const u of relevant) {
       if (u.start_time >= capture.boundaryMs && u.end_time <= capture.cutoffMs) { parts.push(u.text); continue; }
       const words = u.words.filter(w => Number.isFinite(w.start_time) && Number.isFinite(w.end_time));
-      if (!words.length) { this.cancelCapture('识别分句跨越按钮边界且缺少词时间戳，请重新说完整指令'); return; }
-      if (words.some(w => w.start_time >= capture.boundaryMs && w.start_time < capture.cutoffMs && w.end_time > capture.cutoffMs)) {
-        this.cancelCapture('结束时仍在说话，指令截断在词中，请重新说完整指令'); return;
-      }
+      if (!words.length) return { cancel: '识别分句跨越按钮边界且缺少词时间戳，请重新说完整指令' };
+      if (words.some(w => w.start_time >= capture.boundaryMs && w.start_time < capture.cutoffMs && w.end_time > capture.cutoffMs)) return { cancel: '结束时仍在说话，指令截断在词中，请重新说完整指令' };
       const selected = words.filter(w => w.start_time >= capture.boundaryMs && w.start_time <= capture.endMs && w.end_time <= capture.cutoffMs);
       parts.push(selected.map(w => w.text ?? w.word ?? '').join(''));
     }
-    const text = parts.join('').trim(); if (!text) return;
-    clearTimeout(this.finalTimer); this.capture = { status: 'idle', id: capture.id, boundaryMs: capture.boundaryMs, reason: capture.reason, text };
-    this.events.emit('capture', { ...this.capture }); this.changed(); this.events.emit('instruction', { text, id: capture.id, reason: capture.reason });
+    const text = parts.join('').trim();
+    return text ? { text } : { wait: true };
+  }
+  settle(result) {
+    if (!result || result.wait) return;
+    if (result.cancel) { this.cancelCapture(result.cancel); return; }
+    const capture = this.capture;
+    clearTimeout(this.finalTimer);
+    this.capture = { status: 'idle', id: capture.id, boundaryMs: capture.boundaryMs, reason: capture.reason, text: result.text };
+    this.events.emit('capture', { ...this.capture }); this.changed(); this.events.emit('instruction', { text: result.text, id: capture.id, reason: capture.reason });
+  }
+  expireCapture() {
+    if (this.capture.status !== 'finishing') return;
+    const result = this.commandText(this.capture, { allowGap: true });
+    if (result.wait) this.cancelCapture('识别未完成，请重试');
+    else this.settle(result);
+  }
+  tryFinalize() {
+    if (this.capture.status !== 'finishing') return;
+    this.settle(this.commandText(this.capture));
   }
   cancelCapture(reason = 'cancelled') {
     clearTimeout(this.noSpeechTimer); clearTimeout(this.maxTimer); clearTimeout(this.finalTimer);

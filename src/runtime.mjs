@@ -120,7 +120,10 @@ export class MootingRuntime extends EventEmitter {
         if (this.sound2text.state().capture?.status === 'idle') this.scheduleReports();
       };
       const instruction = value => {
-        this.submit({ instruction: value.text }).catch(error => this.record('voice.error', { error: error.message }));
+        this.submit({ instruction: value.text }).catch(error => {
+          this.lastError = error.message;
+          this.record('voice.error', { error: error.message });
+        });
       };
       const capture = value => this.record('voice.capture', value);
       const heard = payload => { if (this.context) this.context.observe({ status: this.sound2text.state().status, utterances: payload?.utterances ?? [] }); };
@@ -197,19 +200,18 @@ export class MootingRuntime extends EventEmitter {
     if (this.errors.length > before && !this.cancelling) throw this.errors.at(-1);
   }
   async interrupt() {
-    this.interactionEpoch++;
-    this.humanInteraction = true;
     const hadSubtitle = this.subtitle.active;
     const hadDisplay = hadSubtitle || this.speaker.active;
+    if (!hadDisplay) return { stopped: false, interrupted: false };
+    this.interactionEpoch++;
+    this.humanInteraction = true;
     try {
       this.record('interaction.started', { subtitleWasActive: hadSubtitle });
-      if (hadDisplay) await this.manager.interrupt();
-      else await this.interruptRouter();
-      return { stopped: hadDisplay, interrupted: !hadDisplay };
+      await this.manager.interrupt();
+      return { stopped: true, interrupted: false };
     } finally { this.humanInteraction = false; this.scheduleReports(); }
   }
   async voiceInteraction({ boundaryMs } = {}) {
-    if (this.subtitle.active || this.speaker.active) return this.interrupt();
     if (!this.sound2text || this.sound2text.state().status !== 'running') throw new InputError('请先开启语音输入', 409);
     if (this.sound2text.state().capture?.status === 'listening') {
       await this.sound2text.finishCapture('manual', boundaryMs); return { finishing: true };
