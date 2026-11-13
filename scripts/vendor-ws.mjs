@@ -1,0 +1,12 @@
+import { createRequire } from 'node:module';
+import { cp, mkdir, readFile, realpath } from 'node:fs/promises';
+import { dirname, resolve, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const require = createRequire(join(root, '../deepseek-harness/package.json'));
+const source = dirname(require.resolve('ws/package.json'));
+const target = join(root, 'vendor/node_modules/ws');
+await mkdir(dirname(target), { recursive: true });
+await cp(source, target, { recursive: true, filter: path => !path.includes('/node_modules/', source.length) });
+const manifest = JSON.parse(await readFile(join(target, 'package.json'), 'utf8'));
+console.log(`Copied ws ${manifest.version} into project vendor; license retained.`);

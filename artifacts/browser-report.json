@@ -1,0 +1,62 @@
+{
+  "passed": true,
+  "launcher": "vendored DSH CLI + isolated profile",
+  "mode": "live",
+  "sessionCount": 1,
+  "tests": [
+    "simulated speaker card fields",
+    "speaker close without new input",
+    "speaker responsive layout",
+    "real Loader startup",
+    "SSE connection",
+    "subtitle launch and display",
+    "single instruction editor",
+    "server Context assembly",
+    "direct interaction exit",
+    "Responses API (test endpoint)",
+    "no settings entry",
+    "model configuration dialog API",
+    "no reconnect or health controls",
+    "real model Worker (test endpoint)",
+    "visible model configuration",
+    "input-output shared row",
+    "full-width Context",
+    "separate Router and Worker rows",
+    "play-pause microphone and locked transcript",
+    "precise button sample checkpoint",
+    "partial revision without dispatch",
+    "final utterance to Agent pipeline",
+    "live ASR subtitle revisions",
+    "subtitle close preserves ASR",
+    "pause restores typing",
+    "original DSH conversation components",
+    "original DSH timeline/table components",
+    "task lifecycle",
+    "single session",
+    "desktop screenshot",
+    "390px responsive layout",
+    "no browser JS exceptions"
+  ],
+  "tasks": [
+    {
+      "id": "55fd707d-ad1c-4a63-8d4c-a3d1730edf30",
+      "capability": "realtime_subtitle",
+      "status": "completed",
+      "inputId": "9b58293f-58db-4a23-95e5-34d912d2e488",
+      "result": {
+        "reason": "user_interaction"
+      }
+    },
+    {
+      "id": "0373f867-7d49-49a1-a830-33947c8c8654",
+      "capability": "explain_term",
+      "status": "completed",
+      "inputId": "8aef583c-fd19-4d0c-b0fc-f388ab8a75d8",
+      "result": {
+        "text": "测试模型接口已处理：请简短解释一下红筹架构",
+        "model": "browser-router",
+        "simulated": false
+      }
+    }
+  ]
+}
