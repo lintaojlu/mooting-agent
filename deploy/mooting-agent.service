@@ -1,0 +1,17 @@
+[Unit]
+Description=MootingAgent web
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/workspace/mooting-agent
+Environment=MOOTING_PORT=4317
+Environment=MOOTING_BASE_PATH=/mooting-agent
+Environment=MOOTING_PUBLIC_HOSTS=nillin.space
+Environment=MOOTING_AUTH=1
+ExecStart=/opt/node-v24/bin/node scripts/start.mjs
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

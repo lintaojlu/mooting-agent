@@ -1,19 +1,20 @@
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
+import { socketAllowed } from '../access.mjs';
 
 /** Same-origin, single-owner PCM transport. Capture controls stay on the Router's HTTP coordination path. */
-export function mountSound2text(server, sound) {
+export function mountSound2text(server, sound, { publicHosts = [], basePath = '', authorize = () => true, identify = () => '', onOwner } = {}) {
   const wss = new WebSocketServer({ noServer: true, maxPayload: 64000, perMessageDeflate: false });
+  const audioPath = `${basePath}/api/sound2text/audio`;
   let owner, closing = false;
   const send = (socket, value) => { if (socket.readyState !== WebSocket.OPEN) return; if (socket.bufferedAmount > 262144) { socket.terminate(); return; } socket.send(JSON.stringify(value)); };
   const reject = (socket, status) => { socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`); };
   function upgrade(req, socket, head) {
     let path; try { path = new URL(req.url, 'http://127.0.0.1').pathname; } catch { return reject(socket, '400 Bad Request'); }
-    if (path !== '/api/sound2text/audio') return;
-    const host = req.headers.host ?? '';
-    if (closing || !/^127\.0\.0\.1:\d+$/.test(host) || req.headers.origin !== `http://${host}`) return reject(socket, '403 Forbidden');
+    if (path !== audioPath) return;
+    if (closing || !socketAllowed(req, publicHosts) || !authorize(req)) return reject(socket, '403 Forbidden');
     if (owner) return reject(socket, '409 Conflict');
-    wss.handleUpgrade(req, socket, head, client => { owner = client; wss.emit('connection', client); });
+    wss.handleUpgrade(req, socket, head, client => { owner = client; client.mootingUser = identify(req); onOwner?.(client.mootingUser, true); wss.emit('connection', client); });
   }
   server.on('upgrade', upgrade);
   wss.on('connection', socket => {
@@ -39,7 +40,7 @@ export function mountSound2text(server, sound) {
       }).catch(error => send(socket, { type: 'error', error: error.message })).finally(() => { queued--; });
     });
     socket.on('error', () => {});
-    socket.on('close', () => { sound.events.off('change', changed); active = false; if (owner === socket) { owner = undefined; void chain.then(() => sound.pause('browser_disconnected')).catch(() => {}); } });
+    socket.on('close', () => { sound.events.off('change', changed); active = false; if (owner === socket) { owner = undefined; onOwner?.(socket.mootingUser, false); void chain.then(() => sound.pause('browser_disconnected')).catch(() => {}); } });
   });
   return async function dispose() {
     closing = true; server.off('upgrade', upgrade);

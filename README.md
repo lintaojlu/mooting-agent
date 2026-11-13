@@ -13,6 +13,17 @@ npm start
 
 打开 http://127.0.0.1:4317 。首次语音采集需要允许浏览器麦克风权限。浏览器只连接本地服务，火山鉴权在后端执行；开启语音即持续向火山上传音频，暂停则停止上传并释放麦克风。
 
+公网入口挂在路径前缀下，由反向代理终止 HTTPS。设置 `MOOTING_PUBLIC_HOSTS` 后默认要求登录；本地不设置这些变量时仍只监听 `127.0.0.1`，不启用账号校验。
+
+```dotenv
+MOOTING_PORT='4317'
+MOOTING_BASE_PATH='/mooting-agent'
+MOOTING_PUBLIC_HOSTS='nillin.space'
+MOOTING_AUTH='1'
+```
+
+账号为 `nil`、`zoe`、`john`、`yanyi`、`fengshuai`、`yuxia`、`zhaoxin`、`olsen`，密码相同，只在服务端比对。登录后写入 HttpOnly Cookie，路径限制在前缀内。每个账号的记忆、信息流片段、会话记录和任务快照都写在 `data/<用户名>/`。麦克风页面必须通过 HTTPS 打开。部署示例见 `deploy/`。
+
 ### 模型
 
 交互 Web 已移除右上角“设置”入口。请在项目 `.env` 中填写 Router / Worker 的 Base URL、模型名称和可选 API Key，保存后重启应用；两者固定使用 Responses API。Worker 可复用 Router，也可单独配置。Base URL 填 `http://127.0.0.1:8000/v1` 等 API 前缀，不包含 `/responses`。

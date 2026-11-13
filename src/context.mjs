@@ -66,7 +66,7 @@ async function completeWithModel({ config, memory, segment, signal }) {
 
 /**
  * First-version context system.
- * Definite conversation segments from the information stream are consolidated by an LLM into data/MEMORY.md.
+ * Definite conversation segments from the information stream are consolidated by an LLM into that user's data/<username>/MEMORY.md.
  * Layered retrieval and lifecycle eviction stay behind remember() / read(); this version serves the whole document.
  */
 export class ContextSystem extends EventEmitter {

@@ -347,8 +347,13 @@
     }
     target.append(list);
   }
+  function api(path) {
+    const base = String(root.mootingBase || '').replace(/\/$/, '');
+    return base + path;
+  }
   async function request(path, body) {
-    const response = await fetch(path, { method: body === undefined ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+    const response = await fetch(api(path), { method: body === undefined ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+    if (response.status === 401) { location.assign(api('/login')); throw new Error('请先登录'); }
     if (!response.ok) { let message; try { message = (await response.json()).error; } catch {} throw new Error(message || '请求失败（HTTP ' + response.status + '）'); }
     return response.json();
   }
@@ -358,11 +363,11 @@
       const value = await request('/api/model/config'); if (current !== generation) return; displayConfig(value, true);
       const next = await request('/api/state'); if (current !== generation) return; applyState(next);
       if (typeof EventSource === 'undefined') throw new Error('当前浏览器不支持 SSE。');
-      source = new EventSource('/api/events');
+      source = new EventSource(api('/api/events'));
       const receive = event => { if (current !== generation) return; try { applyState(JSON.parse(event.data)); connected = true; controls(); } catch (error) { connected = false; notice(error.message, true); controls(); } };
       source.addEventListener('data', receive); source.onmessage = receive;
       source.onopen = () => { if (current === generation) { connected = true; controls(); } };
-      source.onerror = () => { if (current === generation) { connected = false; notice('实时连接中断，正在重连；不会切换为模拟模型。', true); controls(); } };
+      source.onerror = () => { if (current !== generation) return; fetch(api('/api/state')).then(response => { if (response.status === 401) location.assign(api('/login')); }); connected = false; notice('实时连接中断，正在重连；不会切换为模拟模型。', true); controls(); };
     } catch (error) { if (current === generation) { connected = false; notice(error.message, true); controls(); } }
   }
   $('close-settings').addEventListener('click', () => $('model-settings').close());

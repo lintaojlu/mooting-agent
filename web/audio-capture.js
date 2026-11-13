@@ -74,10 +74,11 @@
         if (token !== this.generation) { stream.getTracks().forEach(track => track.stop()); return; }
         this.media = stream;
         for (const track of stream.getTracks()) track.onended = () => this.fail(new Error('麦克风已断开，当前指令已中止。'));
-        await this.context.audioWorklet.addModule('/audio-worklet.js');
+        const base = String(this.env.mootingBase || '').replace(/\/$/, '');
+        await this.context.audioWorklet.addModule(base + '/audio-worklet.js');
         if (token !== this.generation) return;
         const protocol = this.env.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const socket = this.socket = new this.env.WebSocket(protocol + '//' + this.env.location.host + '/api/sound2text/audio');
+        const socket = this.socket = new this.env.WebSocket(protocol + '//' + this.env.location.host + base + '/api/sound2text/audio');
         socket.binaryType = 'arraybuffer';
         await new Promise((resolve, reject) => {
           const timer = this.env.setTimeout(() => reject(new Error('语音识别服务连接超时。')), 10000);

@@ -20,8 +20,8 @@ const PROMPT = `你是用户的私人助理 MootingAgent，同时负责端侧 Ro
 
 /** Coordinates one actual DSH Agent and a session-free internal worker executor. */
 export class MootingRuntime extends EventEmitter {
-  constructor(ctx, { mode = 'live', provider = 'mooting-live', model = 'unconfigured', workers, models, sound2text, context } = {}) {
-    super(); this.ctx = ctx; this.mode = mode; this.provider = provider; this.model = model; this.models = models; this.context = context ?? null;
+  constructor(ctx, { mode = 'live', provider = 'mooting-live', model = 'unconfigured', workers, models, sound2text, context, homes } = {}) {
+    super(); this.ctx = ctx; this.mode = mode; this.provider = provider; this.model = model; this.models = models; this.context = context ?? null; this.homes = homes ?? null; this.actor = undefined; this.audioOwner = undefined; this.lastUser = undefined;
     this.stream = null; this.currentContext = null; this.lastError = null;
     this.trace = []; this.sequence = 0; this.busy = false; this.pending = undefined; this.current = undefined;
     this.sound2text = sound2text; this.humanInteraction = false; this.cancelling = false; this.deliveryScheduled = false;
@@ -29,9 +29,14 @@ export class MootingRuntime extends EventEmitter {
     this.admissions = Promise.resolve(); this.admissionCount = 0; this.interactionEpoch = 0; this.pendingReports = [];
     this.subtitle = { active: false, text: '' };
     this.speaker = { active: false, person: null, simulated: true };
+    this.taskOwners = new Map(); this.views = new Map(); this.errorsByUser = new Map(); this.contextsByUser = new Map();
     if (!workers) throw new Error('Router requires the mootingWorkers service');
     this.manager = workers.manager;
     const event = ({ type, data, taskId }) => {
+      if (taskId && !this.taskOwners.has(taskId)) {
+        const owner = this.actor || this.current?.user || (this.homes ? this.audioOwner : '');
+        if (owner) this.taskOwners.set(taskId, owner);
+      }
       this.record(type, data, taskId, 'worker');
       if (type === 'worker.report') {
         this.pendingReports.push({ taskId, ...data });
@@ -39,27 +44,81 @@ export class MootingRuntime extends EventEmitter {
         this.scheduleReports();
       }
     };
-    const subtitle = value => { this.subtitle = value; this.changed(); };
-    const speaker = value => { this.speaker = value; this.changed(); };
+    const subtitle = value => { this.rememberView(value?.taskId, 'subtitle', value); this.subtitle = value; this.changed(); };
+    const speaker = value => { this.rememberView(value?.taskId, 'speaker', value); this.speaker = value; this.changed(); };
     workers.events.on('speaker', speaker);
     workers.events.on('worker-event', event); workers.events.on('subtitle', subtitle);
     this.releaseWorkers = () => { workers.events.off('speaker', speaker); workers.events.off('worker-event', event); workers.events.off('subtitle', subtitle); };
-    if (this.context) { const onContext = () => this.changed(); this.context.on('change', onContext); this.releaseContext = () => this.context.off('change', onContext); };
+    const watched = this.homes ? [...this.homes.contexts.values()] : this.context ? [this.context] : [];
+    if (watched.length) { const onContext = () => this.changed(); for (const item of watched) item.on('change', onContext); this.releaseContext = () => { for (const item of watched) item.off('change', onContext); }; };
+  }
+  contextFor(username) {
+    if (this.homes) return username ? this.homes.context(username) ?? null : null;
+    return this.context ?? null;
   }
   record(type, data, taskId, role = 'system') {
     if (type === 'router.error') this.lastError = data.error ?? '任务执行失败';
-    const item = { id: ++this.sequence, at: new Date().toISOString(), type, role, ...(taskId ? { taskId } : {}), data };
+    const user = this.actor || this.current?.user || (taskId && this.taskOwners.get(taskId)) || (this.homes ? this.audioOwner : '');
+    const item = { id: ++this.sequence, at: new Date().toISOString(), type, role, ...(user ? { user } : {}), ...(taskId ? { taskId } : {}), data };
     this.trace.push(item); if (this.trace.length > 600) this.trace.splice(0, this.trace.length - 600);
+    if (type === 'router.error' && user) this.errorsByUser.set(user, data.error ?? '任务执行失败');
+    if (this.homes && user) { this.homes.note(user, item); this.captureWorkspace(user); }
     this.changed(); return item;
   }
+  rememberView(taskId, key, value) {
+    const user = (taskId && this.taskOwners.get(taskId)) || this.actor || this.current?.user || (this.homes ? this.audioOwner : '');
+    if (!user) return;
+    const view = this.views.get(user) ?? {};
+    view[key] = value;
+    this.views.set(user, view);
+    this.captureWorkspace(user);
+  }
+  tasksFor(username) {
+    const saved = this.homes?.workspace(username).tasks ?? [];
+    const live = this.manager.tasks().filter(task => this.taskOwners.get(task.id) === username);
+    const merged = new Map(saved.filter(task => task?.id).map(task => [task.id, task]));
+    for (const task of live) merged.set(task.id, task);
+    return [...merged.values()];
+  }
+  captureWorkspace(username) {
+    if (!this.homes || !username) return;
+    const view = this.views.get(username) ?? {};
+    this.homes.saveWorkspace(username, {
+      subtitle: view.subtitle ?? { active: false, text: '' },
+      speaker: view.speaker ?? { active: false, person: null, simulated: true },
+      lastError: this.errorsByUser.get(username) ?? null,
+      currentContext: this.contextsByUser.get(username) ?? null,
+      tasks: this.tasksFor(username),
+    });
+  }
   changed() { this.emit('change'); }
-  state() {
-    return { sessionId: SESSION_ID, mode: this.mode, model: this.model, busy: this.busy, queued: !!this.pending,
-      sessionCount: this.ctx.agents.list().length, trace: structuredClone(this.trace), tasks: this.manager.tasks(),
-      sound2text: this.sound2text?.state() ?? { configured: false, status: 'stopped', text: '', capture: { status: 'idle' } },
-      subtitle: { ...this.subtitle }, speaker: structuredClone(this.speaker), capabilities: this.manager.capabilities(),
-      lastError: this.lastError, currentContext: this.currentContext, context: this.context?.state() ?? { memory: '', fragments: [], status: 'idle', configured: false, updatedAt: null }, events: this.agent?.session.snapshotEvents().slice(-1500) ?? [], stream: this.stream,
+  state(username) {
+    const scoped = Boolean(this.homes);
+    const trace = scoped ? (this.homes.logs.get(username) ?? []) : this.trace;
+    const seqs = new Set(trace.flatMap(item => Number.isInteger(item.seq) ? [item.seq] : []));
+    const restored = trace.filter(item => Number.isInteger(item.seq)).map(item => ({ seq: item.seq, time: item.time, type: item.type.startsWith('dsh.') ? item.type.slice(4) : item.type, data: item.data }));
+    const liveEvents = this.agent?.session.snapshotEvents().slice(-1500) ?? [];
+    const liveBySeq = new Map(liveEvents.filter(event => seqs.has(event.seq)).map(event => [event.seq, event]));
+    const events = scoped ? restored.map(event => liveBySeq.get(event.seq) ?? event) : liveEvents;
+    const context = this.contextFor(scoped ? username : undefined);
+    const view = scoped ? (this.views.get(username) ?? this.homes.workspace(username)) : {};
+    const ownsLive = !scoped || this.current?.user === username;
+    return { sessionId: scoped && username ? `mooting-${username}` : SESSION_ID, mode: this.mode, model: this.model, busy: ownsLive ? this.busy : false, queued: ownsLive ? !!this.pending : false,
+      sessionCount: this.ctx.agents.list().length, trace: structuredClone(trace), tasks: scoped ? this.tasksFor(username) : this.manager.tasks(),
+      sound2text: this.soundFor(username, scoped),
+      subtitle: scoped ? (view.subtitle || { active: false, text: '' }) : { ...this.subtitle },
+      speaker: scoped ? structuredClone(view.speaker || { active: false, person: null, simulated: true }) : structuredClone(this.speaker),
+      capabilities: this.manager.capabilities(),
+      lastError: scoped ? (this.errorsByUser.get(username) ?? null) : this.lastError,
+      currentContext: scoped ? (this.currentContext?.user === username ? this.currentContext : (this.contextsByUser.get(username) ?? null)) : this.currentContext,
+      context: context?.state() ?? { memory: '', fragments: [], status: 'idle', configured: false, updatedAt: null }, events, stream: ownsLive ? this.stream : null,
       modelConfig: this.models?.state() ?? { protocol: 'responses', configured: true, router: { model: this.model, baseURL: '', hasApiKey: false }, worker: { model: this.model, baseURL: '', hasApiKey: false }, workerUsesRouter: true, verified: false } };
+  }
+  soundFor(username, scoped) {
+    const idle = { configured: false, status: 'stopped', text: '', capture: { status: 'idle' } };
+    const sound = this.sound2text?.state() ?? idle;
+    if (!scoped || this.audioOwner === username) return sound;
+    return { configured: !!sound.configured, status: 'stopped', text: '', capture: { status: 'idle' } };
   }
   async initialize() {
     this.disposers = [
@@ -120,10 +179,10 @@ export class MootingRuntime extends EventEmitter {
         if (this.sound2text.state().capture?.status === 'idle') this.scheduleReports();
       };
       const instruction = value => {
-        this.submit({ instruction: value.text }).catch(error => this.record('voice.error', { error: error.message }));
+        this.submit({ instruction: value.text }, this.audioOwner).catch(error => this.record('voice.error', { error: error.message }));
       };
       const capture = value => this.record('voice.capture', value);
-      const heard = payload => { if (this.context) this.context.observe({ status: this.sound2text.state().status, utterances: payload?.utterances ?? [] }); };
+      const heard = payload => { const context = this.contextFor(this.homes ? this.audioOwner : undefined); if (context) context.observe({ status: this.sound2text.state().status, utterances: payload?.utterances ?? [] }); };
       this.sound2text.events.on('capture', capture);
       this.sound2text.events.on('change', change);
       this.sound2text.events.on('instruction', instruction);
@@ -131,27 +190,40 @@ export class MootingRuntime extends EventEmitter {
       this.disposers.push(() => { this.sound2text.events.off('capture', capture); this.sound2text.events.off('change', change); this.sound2text.events.off('instruction', instruction); this.sound2text.events.off('text', heard); });
     }
     if (this.models) this.models.journal = (type, data) => this.agent.session.append(type, data);
-    if (this.ctx.agents.list().length !== 1) throw new Error('原型必须且只能创建一个 DSH Session');
-    this.record('runtime.ready', { sessionId: SESSION_ID, mode: this.mode, persistence: 'in-memory' });
+    if (this.homes) {
+      for (const username of this.homes.accounts) {
+        const workspace = this.homes.workspace(username);
+        if (workspace.subtitle || workspace.speaker) this.views.set(username, { subtitle: workspace.subtitle, speaker: workspace.speaker });
+        if (workspace.lastError) this.errorsByUser.set(username, workspace.lastError);
+        if (workspace.currentContext) this.contextsByUser.set(username, workspace.currentContext);
+        for (const task of workspace.tasks ?? []) if (task?.id) this.taskOwners.set(task.id, username);
+      }
+    }
+    if (!this.homes && this.ctx.agents.list().length !== 1) throw new Error('原型必须且只能创建一个 DSH Session');
+    this.record('runtime.ready', { sessionId: SESSION_ID, mode: this.mode, persistence: this.homes ? 'data/<user>' : 'in-memory' });
   }
-  async submit(value) {
+  setAudioOwner(username, active) { this.audioOwner = active ? username || undefined : this.audioOwner === username ? undefined : this.audioOwner; }
+  async submit(value, username) {
+    if (this.homes && !this.contextFor(username)) throw new InputError('未知用户', 403);
     if (this.configuring) throw new InputError('模型配置正在保存，请稍后提交', 409);
     if (this.models && !this.models.state().configured) throw new InputError('请先在模型配置中设置 Router 和 Worker 的真实模型', 409);
     const snapshot = snapshotInput(value);
     if (this.admissionCount >= 2) throw new InputError('输入提交繁忙，请稍后重试', 409);
     this.admissionCount++;
-    const operation = this.admissions.then(() => this.admit(snapshot));
+    const operation = this.admissions.then(() => this.admit(snapshot, username));
     this.admissions = operation.catch(() => {});
     try { return await operation; } finally { this.admissionCount--; this.scheduleReports(); }
   }
-  async admit(input) {
+  async admit(input, username) {
     if (this.closed) throw new InputError('系统正在退出', 503);
     this.humanInteraction = true;
     try {
       await this.interruptRouter();
-      const memory = this.context ? await this.context.read() : '';
+      const context = this.contextFor(username);
+      const memory = context ? await context.read() : '';
       const prompt = composeUserPrompt(memory, input.instruction);
-      const snapshot = Object.freeze({ ...input, command: input.instruction, prompt, interactionEpoch: ++this.interactionEpoch });
+      const snapshot = Object.freeze({ ...input, command: input.instruction, prompt, user: username || undefined, interactionEpoch: ++this.interactionEpoch });
+      if (username) { this.lastUser = username; this.contextsByUser.set(username, snapshot); this.captureWorkspace(username); }
       await this.manager.interrupt();
       this.snapshots.set(snapshot.id, snapshot);
       while (this.snapshots.size > 32) this.snapshots.delete(this.snapshots.keys().next().value);
@@ -177,7 +249,7 @@ export class MootingRuntime extends EventEmitter {
       this.deliveryScheduled = false;
       if (this.closed || this.busy || this.cancelling || this.humanInteraction || this.admissionCount || this.captureBlocksReports() || !this.pendingReports.length) return;
       const reports = this.pendingReports.splice(0);
-      this.launch({ kind: 'task_event', id: `event-${this.sequence}`, instruction: '后台任务状态已更新，请根据实际结果简短回复。', context: [], task_events: reports });
+      this.launch({ kind: 'task_event', id: `event-${this.sequence}`, instruction: '后台任务状态已更新，请根据实际结果简短回复。', context: [], task_events: reports, user: this.audioOwner || this.lastUser });
     });
   }
   launch(input) {
@@ -196,7 +268,12 @@ export class MootingRuntime extends EventEmitter {
     await this.agent.whenIdle();
     if (this.errors.length > before && !this.cancelling) throw this.errors.at(-1);
   }
-  async interrupt() {
+  async interrupt(username) {
+    const previous = this.actor; if (username) this.actor = username;
+    try { return await this.interruptBody(); }
+    finally { this.actor = previous; }
+  }
+  async interruptBody() {
     this.interactionEpoch++;
     this.humanInteraction = true;
     const hadSubtitle = this.subtitle.active;
@@ -208,7 +285,12 @@ export class MootingRuntime extends EventEmitter {
       return { stopped: hadDisplay, interrupted: !hadDisplay };
     } finally { this.humanInteraction = false; this.scheduleReports(); }
   }
-  async voiceInteraction({ boundaryMs } = {}) {
+  async voiceInteraction({ boundaryMs, username } = {}) {
+    const previous = this.actor; this.actor = username || previous;
+    try { return await this.voiceInteractionBody({ boundaryMs }); }
+    finally { this.actor = previous; }
+  }
+  async voiceInteractionBody({ boundaryMs } = {}) {
     if (this.subtitle.active || this.speaker.active) return this.interrupt();
     if (!this.sound2text || this.sound2text.state().status !== 'running') throw new InputError('请先开启语音输入', 409);
     if (this.sound2text.state().capture?.status === 'listening') {

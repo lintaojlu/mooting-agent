@@ -72,8 +72,9 @@ test('input-output row and Context Router Worker row use DSH views', () => {
   const form = html.match(/<form id="submit-form"[\s\S]*?<\/form>/)[0];
   assert.equal((form.match(/<button\b/g) || []).length, 1);
   assert.doesNotMatch(form, /textarea|id="inform_stream"|id="audio-toggle"/);
-  assert.ok(html.indexOf('src="/dsh-views.js"') < html.indexOf('src="/app.js"'));
-  assert.ok(html.includes('href="/dsh-views.css"'));
+  assert.ok(html.indexOf('src="dsh-views.js"') < html.indexOf('src="app.js"'));
+  assert.ok(html.includes('href="dsh-views.css"'));
+  assert.ok(html.includes('name="mooting-base"') && html.includes('%%BASE%%') && html.includes('%%BASE_HREF%%'));
   assert.match(app, /renderConversation\(\$\('agent-conversation'\), \{ events: state\.events, stream: state\.stream, busy: state\.busy \}\)/);
   assert.match(app, /renderTrajectory\(\$\('trajectory-view'\), \{ events: state\.events, stream: state\.stream, busy: state\.busy \}\)/);
   assert.match(app, /renderWorkers\(\$\('worker-conversation'\)/);
@@ -179,7 +180,7 @@ test('voice mode locks text entry and routes all capture controls through backen
 });
 test('microphone uses SVG playback controls and dedicated PCM worklet resources', () => {
   assert.match(html, /id="audio-toggle"/); assert.match(html, /class="play-symbol"/); assert.match(html, /class="pause-symbol"/);
-  assert.match(html, /src="\/audio-capture.js"/); assert.match(app, /\$\('inform_stream'\)\.readOnly = true/);
+  assert.match(html, /src="audio-capture.js"/); assert.match(app, /\$\('inform_stream'\)\.readOnly = true/);
   assert.match(app, /\/api\/voice\/interaction/); assert.match(app, /sound2text\?\.configured/);
   assert.doesNotMatch(app, /MediaRecorder|audio\/webm/);
 });

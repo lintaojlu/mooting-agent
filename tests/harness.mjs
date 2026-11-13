@@ -15,7 +15,7 @@ import ModelsPlugin from '../src/models-plugin.mjs';
 import { FakeSound2text } from './fake-sound2text.mjs';
 
 /** Test-only mounting. The application itself always starts via a DSH profile. */
-export async function harness({ adapter = new MockRouterAdapter(), mode = 'mock', realModels = false, configPath, runWorker, sound2text = new FakeSound2text(), context } = {}) {
+export async function harness({ adapter = new MockRouterAdapter(), mode = 'mock', realModels = false, configPath, runWorker, sound2text = new FakeSound2text(), context, homes } = {}) {
   const ctx = new Context();
   for (const plugin of [LlmRuntime, SessionStore, SessionProjection, SystemPrompt, Tools, NativeExecutor, AgentRegistry]) await ctx.plugin(plugin);
   await ctx.plugin(AgentLoop, { agents: [] });
@@ -32,7 +32,7 @@ export async function harness({ adapter = new MockRouterAdapter(), mode = 'mock'
   const config = realModels ? ctx.mootingModels.state() : undefined;
   const runtime = new MootingRuntime(ctx, { mode: realModels ? config.configured ? 'live' : 'unconfigured' : mode,
     provider: realModels ? 'mooting-live' : 'mooting-mock', model: realModels ? config.router.model || 'unconfigured' : 'scripted-router',
-    workers: ctx.mootingWorkers, sound2text, context, ...(realModels ? { models: ctx.mootingModels } : {}) });
+    workers: ctx.mootingWorkers, sound2text, context, homes, ...(realModels ? { models: ctx.mootingModels } : {}) });
   await runtime.initialize();
   return { ctx, runtime, async dispose() { await runtime.dispose(); await ctx.fiber.dispose(); } };
 }
