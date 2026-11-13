@@ -134,11 +134,9 @@
     return { active, running: localStatus === 'running' && remote === 'running', readOnly: active, busyAudio, capturing,
       label: localStatus === 'connecting' || remote === 'connecting' ? '正在开启语音…' : localStatus === 'stopping' || remote === 'stopping' ? '正在停止语音…' : active ? '语音输入中' : remote === 'error' ? '语音不可用' : '语音未开启' };
   }
-  function interactionRequest(value, instruction, localStatus = 'idle') {
-    if (value.subtitle.active || value.speaker?.active) return { path: '/api/interaction', body: {} };
-    if (audioState(value, localStatus).active) return { path: '/api/voice/interaction', body: {} };
-    if (value.busy && !instruction.trim()) return { path: '/api/interaction', body: { intent: 'interrupt' } };
-    return { path: '/api/submit', body: submission(instruction) };
+  function interactionRequest(value, _instruction, localStatus = 'idle') {
+    if (!audioState(value, localStatus).running) throw new Error('请先开启语音输入。');
+    return { path: '/api/voice/interaction', body: {} };
   }
   root.MootingUI = { captureFeedback, audioState, interactionRequest, submission, validateState, validateConfig, modelSubmission, latestRouterAnswer, routerDialogue, outputContent, functionPanel, commandPanel, contextPanel };
   if (typeof document === 'undefined') return;
@@ -152,7 +150,7 @@
   }
   renderClock();
   const clockTimer = setInterval(renderClock, 10000);
-  let state, config, source, connected = false, submitting = false, saving = false, generation = 0, configLoaded = false, formDirty = false;
+  let state, config, source, connected = false, dictating = false, closing = false, saving = false, generation = 0, configLoaded = false, formDirty = false;
   let audio, localAudioStatus = 'idle', lastSoundError = '', lastCaptureError = '';
   const captureClass = root.MootingAudio?.AudioCapture;
   if (captureClass) audio = new captureClass({ onStatus: status => { localAudioStatus = status; controls(); }, onError: message => notice(message, true) });
@@ -160,9 +158,9 @@
   function controls() {
     const configured = config?.configured === true || state?.mode === 'mock';
     const subtitleActive = !!state?.subtitle.active, speakerActive = !!state?.speaker?.active, voice = audioState(state, localAudioStatus);
-    const voiceOn = voice.active && configured;
-    $('submit-button').disabled = !connected || submitting || !voiceOn || voice.busyAudio || voice.capturing === 'finishing';
-    $('submit-button').setAttribute('aria-label', speakerActive ? '关闭说话人识别' : subtitleActive ? '关闭字幕' : voice.capturing === 'listening' ? '结束语音指令' : voice.running ? '开始语音指令' : '发送指令');
+    const dictateBusy = dictating && voice.capturing === 'finishing';
+    $('submit-button').disabled = !connected || dictateBusy || !configured || !voice.running || voice.busyAudio || voice.capturing === 'finishing';
+    $('submit-button').setAttribute('aria-label', '口述指令');
     $('save-model').disabled = saving || !!state?.busy;
     $('audio-toggle').disabled = !connected || localAudioStatus === 'stopping' || !audio;
     $('audio-toggle').setAttribute('aria-pressed', String(voice.active));
@@ -170,7 +168,8 @@
     $('audio-toggle').title = voice.active ? '暂停语音输入' : '开启语音输入';
     $('audio-toggle').querySelector('.play-symbol').toggleAttribute('hidden', voice.active);
     $('audio-toggle').querySelector('.pause-symbol').toggleAttribute('hidden', !voice.active);
-    $('esc-button').disabled = !connected || submitting || !voiceOn;
+    $('esc-button').disabled = !connected || closing || !(subtitleActive || speakerActive);
+    $('esc-button').setAttribute('aria-label', '关闭功能面板');
     $('inform_stream').readOnly = true;
     const text = state?.sound2text?.text;
     if (typeof text === 'string' && $('inform_stream').value !== text.slice(-12000)) {
@@ -383,26 +382,31 @@
     } catch (error) { $('config-feedback').textContent = error.message; }
     finally { saving = false; controls(); }
   });
-  $('submit-form').addEventListener('submit', async event => {
-    event.preventDefault(); if ($('submit-button').disabled) return;
+  let confirmChain = Promise.resolve();
+  async function sendConfirm() {
+    const voice = audioState(state, localAudioStatus);
+    if (!connected || !voice.running || voice.busyAudio || voice.capturing === 'finishing' || !(config?.configured === true || state?.mode === 'mock')) return;
     try {
-      const next = interactionRequest(state, $('inform_stream').value, localAudioStatus);
-      submitting = true; controls(); notice('');
-      if (next.path === '/api/voice/interaction') next.body.boundaryMs = await audio.checkpoint();
+      const next = interactionRequest(state, '', localAudioStatus);
+      dictating = true; controls(); notice('');
+      next.body.boundaryMs = await audio.checkpoint();
       await request(next.path, next.body);
       applyState(await request('/api/state'));
-    }
-    catch (error) { notice(error.message, true); }
-    finally { submitting = false; controls(); }
+    } catch (error) { notice(error.message, true); }
+    finally { dictating = false; controls(); }
+  }
+  $('submit-form').addEventListener('submit', event => {
+    event.preventDefault(); if ($('submit-button').disabled) return;
+    confirmChain = confirmChain.then(sendConfirm, sendConfirm);
   });
   async function closeFunction() {
     if ($('esc-button').disabled || !(state?.subtitle?.active || state?.speaker?.active)) return;
     try {
-      submitting = true; controls(); notice('');
+      closing = true; controls(); notice('');
       await request('/api/interaction', {});
       applyState(await request('/api/state'));
     } catch (error) { notice(error.message, true); }
-    finally { submitting = false; controls(); }
+    finally { closing = false; controls(); }
   }
   $('esc-button').addEventListener('click', () => { closeFunction(); });
   document.addEventListener('keydown', event => {

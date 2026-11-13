@@ -36,8 +36,7 @@ textarea { resize:vertical; min-height:115px; }
 .audio-toggle[aria-pressed="true"] { background:transparent; color:#ffffff; }
 .audio-toggle[aria-pressed="true"]::before { background:#171717; }
 .audio-toggle[aria-pressed="true"]:hover:not(:disabled)::before { background:#383838; }
-.esc-button,.primary-button { display:inline-flex; align-items:center; justify-content:center; height:calc(34px * 19.5 / 24); padding:0 8px; border:0; border-radius:6px; background:#171717; color:#ffffff; font-size:11px; font-weight:600; letter-spacing:.04em; line-height:1; touch-action:manipulation; -webkit-tap-highlight-color:transparent; }
-.esc-button { width:calc(34px * 19.5 / 24); padding:0; }
+.esc-button,.primary-button { display:inline-flex; align-items:center; justify-content:center; height:calc(34px * 19.5 / 24); padding:0 10px; border:0; border-radius:6px; background:#171717; color:#ffffff; font-size:11px; font-weight:600; letter-spacing:0; line-height:1; white-space:nowrap; touch-action:manipulation; -webkit-tap-highlight-color:transparent; }
 .esc-button:hover:not(:disabled),.primary-button:hover:not(:disabled) { background:#383838; }
 textarea[readonly] { background:#f5f5f5; color:#333333; cursor:default; }
 .submit-row { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; margin-top:16px; }

@@ -114,7 +114,7 @@ test('sample checkpoints handle future PCM and past transport arrival without pr
   assert.equal(instructions[0].text, '之后'); assert.equal(instructions[0].reason, 'manual');
   sound.pushAudio(pcm(100, true)); sound.armCapture(550); assert.equal(sound.capture.heardSpeech, true);
   assert.equal(sound.capture.lastVoiceMs, 600); sound.cancelCapture();
-  assert.throws(() => sound.armCapture(1100), /边界/); assert.throws(() => sound.armCapture(-1), /边界/);
+  assert.throws(() => sound.armCapture(sound.audioMs + 8001), /边界/); assert.throws(() => sound.armCapture(-1), /边界/);
 });
 
 test('manual end rejects a word or sentence extending beyond the end checkpoint', async t => {
@@ -183,6 +183,23 @@ test('HTTP handshake refusal preserves the useful status instead of generic conn
   assert.ok(!JSON.stringify(sound.state()).includes('fixture-private-key'));
 });
 
+
+test('confirm may lead in-flight audio, and a definite command survives a longer acoustic tail', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const sound = new Sound2Text({ config: { apiKey: 'x', resourceId: 'x', finalWaitMs: 3000 } }); await sound.ready;
+  sound.status = 'running'; sound.sequence = 2; sound.socket = { bufferedAmount: 0, send() {} };
+  const instructions = []; sound.events.on('instruction', event => instructions.push(event));
+  sound.armCapture(); sound.pushAudio(pcm(500, true));
+  sound.finishCapture('manual', sound.audioMs + 1000);
+  assert.equal(sound.capture.status, 'finishing'); assert.equal(instructions.length, 0);
+  sound.handleResult({ result: { utterances: [utterance('打开字幕', 0, 200)] } });
+  assert.equal(instructions.length, 0);
+  sound.pushAudio(pcm(1000));
+  assert.equal(instructions.length, 0, 'acoustic tail beyond the transcript must wait for the deadline');
+  t.mock.timers.tick(4000);
+  assert.equal(instructions.length, 1); assert.equal(instructions[0].text, '打开字幕');
+  t.mock.timers.reset();
+});
 
 test('shifted final timestamps replace drafts and unblock a complete command exactly once', async t => {
   const { sound } = await fixture(t); await sound.start(); const instructions = [];
