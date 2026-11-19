@@ -104,12 +104,18 @@
     const parts = String(text ?? '').split(/(?<=[。！？!?])\s*|\n+/u).map(part => part.trim()).filter(Boolean);
     return parts.at(-1) ?? '';
   }
+  function plainReply(text) {
+    return String(text ?? '').replace(/\*\*/g, '');
+  }
   function agentCard(value) {
-    const partial = value?.busy ? limitChars(value?.stream?.text ?? '') : '';
+    const partial = value?.busy ? limitChars(plainReply(value?.stream?.text ?? '')) : '';
     if (partial) return { text: partial, live: true };
     if (value?.busy) return { text: '正在处理指令', live: true };
     if (value?.lastError) return { text: '执行失败：' + value.lastError, live: false };
-    return { text: limitChars(latestRouterAnswer(value?.trace)), live: false };
+    return { text: limitChars(plainReply(latestRouterAnswer(value?.trace))), live: false };
+  }
+  function transcriptLines(text) {
+    return String(text ?? '').split('\n').map(line => line.trim()).filter(Boolean);
   }
   function commandPanel(value) {
     const capture = value?.sound2text?.capture;
@@ -159,10 +165,13 @@
     return ['积压 ' + context.outbox + ' 条', models, flush].filter(Boolean).join('｜');
   }
   function contextTraceSummary(entry) {
-    const labels = { 'speech.final': '语音定稿', 'speech.paused': '语音暂停', 'turn.queued': '回合入队', 'router.busy': 'Router 执行中', 'router.idle': 'Router 空闲', 'flush.start': '开始写入', 'flush.deferred': '等待 Router 空闲', 'flush.offline': '记忆服务离线', 'flush.sealed': '封装批次', 'flush.end': '写入结束', 'flush.failed': '写入失败', 'flush.retry': '安排重试', 'retain.submitted': '提交 Hindsight', 'retain.check': '检查写入状态', 'retain.status': '写入状态', 'retain.completed': '写入完成', 'cache.refresh.start': '开始刷新缓存', 'cache.model': '模型缓存更新', 'cache.model.failed': '模型缓存失败', 'cache.refresh.end': '缓存刷新完成', 'hindsight.status': '记忆服务状态', 'memory.search.start': '开始检索', 'memory.search.end': '检索完成', 'memory.search.failed': '检索失败', 'memory.search.unavailable': '检索不可用', 'memory.reflect.start': '开始回想', 'memory.reflect.end': '回想完成', 'memory.reflect.failed': '回想失败', 'memory.reflect.unavailable': '回想不可用' };
+    const labels = { 'memory.read': '读取并注入 Router', 'outbox.read': '读取待写批次', 'retain.request': '写入 Hindsight 请求', 'speech.final': '语音定稿', 'speech.paused': '语音暂停', 'turn.queued': '回合入队', 'router.busy': 'Router 执行中', 'router.idle': 'Router 空闲', 'flush.start': '开始写入', 'flush.deferred': '等待 Router 空闲', 'flush.offline': '记忆服务离线', 'flush.sealed': '封装批次', 'flush.end': '写入结束', 'flush.failed': '写入失败', 'flush.retry': '安排重试', 'retain.submitted': '提交 Hindsight', 'retain.check': '检查写入状态', 'retain.status': '写入状态', 'retain.completed': '写入完成', 'cache.refresh.start': '开始刷新缓存', 'cache.model': '模型缓存更新', 'cache.model.failed': '模型缓存失败', 'cache.refresh.end': '缓存刷新完成', 'hindsight.status': '记忆服务状态', 'memory.search.start': '开始检索', 'memory.search.end': '检索完成', 'memory.search.failed': '检索失败', 'memory.search.unavailable': '检索不可用', 'memory.reflect.start': '开始回想', 'memory.reflect.end': '回想完成', 'memory.reflect.failed': '回想失败', 'memory.reflect.unavailable': '回想不可用' };
     const data = entry?.data ?? {};
+    const content = entry?.type === 'memory.read' ? data.injected : data.content ?? data.text ?? data.answer;
+    const preview = typeof content === 'string' ? content.replace(/\s+/g, ' ').trim().slice(0, 180) : '';
     return { at: entry?.at ?? '', type: entry?.type ?? '', label: labels[entry?.type] || entry?.type || '未知事件',
-      detail: [data.documentId, data.id, data.reason, data.status, data.text, data.query, data.error].filter(Boolean).join(' · ') };
+      detail: [data.documentId, data.id, data.reason, data.status, preview || data.query, data.error].filter(Boolean).join(' · '),
+      content: typeof content === 'string' ? content : '', data };
   }
   const OPENINGS = ['已准备好做你的co-pilot！', '我在。想先做点什么？', '随时可以开始。', '今天想一起搞定什么？', '准备好了，把指令交给我。'];
   let openingIndex = 0;
@@ -197,7 +206,7 @@
     if (!audioState(value, localStatus).running) throw new Error('请先开启语音输入。');
     return { path: '/api/voice/interaction', body: {} };
   }
-  root.MootingUI = { captureFeedback, audioState, interactionRequest, submission, validateState, validateConfig, modelSubmission, latestRouterAnswer, routerDialogue, outputContent, functionPanel, mainCaption, lastSentence, agentCard, commandPanel, contextPanel, memoryInfo, contextTraceSummary };
+  root.MootingUI = { captureFeedback, audioState, interactionRequest, submission, validateState, validateConfig, modelSubmission, latestRouterAnswer, routerDialogue, outputContent, functionPanel, mainCaption, lastSentence, agentCard, transcriptLines, commandPanel, contextPanel, memoryInfo, contextTraceSummary };
   if (typeof document === 'undefined') return;
   openingIndex = Math.floor(Math.random() * OPENINGS.length);
   const $ = id => document.getElementById(id);
@@ -302,8 +311,15 @@
     const detail = document.createElement('td');
     const disclosure = document.createElement('details');
     const summary = document.createElement('summary'); summary.textContent = record.detail || record.type;
-    const raw = document.createElement('pre'); raw.textContent = JSON.stringify(entry.data ?? {}, null, 2);
-    disclosure.append(summary, raw); detail.append(disclosure);
+    const raw = document.createElement('pre'); raw.textContent = JSON.stringify(record.data, null, 2);
+    disclosure.append(summary);
+    if (record.content) {
+      const content = document.createElement('pre');
+      content.className = 'context-trace-content';
+      content.textContent = record.content;
+      disclosure.append(content);
+    }
+    disclosure.append(raw); detail.append(disclosure);
     row.append(when, stage, detail);
     return row;
   }
@@ -322,12 +338,22 @@
     $('context-trace-count').textContent = String(Math.max(state?.context?.traceCount ?? 0, contextTraceEntries.size));
   }
   let trajectoryPane = null;
+  function paintTranscript(text) {
+    const node = $('main-text');
+    const lines = transcriptLines(text);
+    node.replaceChildren(...lines.map((line, index) => {
+      const row = document.createElement('p');
+      row.className = 'transcript-line' + (index === lines.length - 1 ? ' is-latest' : '');
+      row.textContent = line;
+      return row;
+    }));
+  }
   function paintAgent(text, live) {
     const node = $('output-text');
     node.replaceChildren();
     const body = document.createElement('p');
     body.className = 'output-turn-body' + (live ? ' thinking' : '');
-    body.textContent = text;
+    body.textContent = plainReply(text);
     node.append(body);
     node.classList.remove('thinking');
   }
@@ -381,6 +407,7 @@
     $('context-status').title = memory.error;
     $('context-memory-info').textContent = memory.info;
     $('context-memory-info').hidden = !memory.info;
+    renderServiceSettings(state);
     renderContextTrace(state.context.trace);
     $('context-trace-count').textContent = String(Math.max(state.context.traceCount ?? 0, contextTraceEntries.size));
     const speakerActive = !!state.speaker?.active;
@@ -388,11 +415,12 @@
     $('output-stage').classList.toggle('is-function', !!fn.kind);
     $('function-panel').setAttribute('aria-hidden', String(!fn.kind));
     $('function-panel').classList.toggle('is-speaker', speakerActive);
-    $('main-text').textContent = mainCaption(state);
+    paintTranscript(mainCaption(state));
     renderAgent();
     $('speaker-card').hidden = !speakerActive;
     const person = state.speaker?.person;
-    $('speaker-card-title').textContent = person?.name ?? '正在识别…';
+    $('speaker-card-title').textContent = '社交卡片';
+    $('speaker-name').textContent = person?.name ?? '正在识别…';
     $('speaker-identity').textContent = person?.identity ?? '—';
     if (speakerActive) $('function-window').scrollTop = 0;
     renderSpeakerNotes(person?.notes);
@@ -445,7 +473,35 @@
       source.onerror = () => { if (current !== generation) return; fetch(api('/api/state')).then(response => { if (response.status === 401) location.assign(api('/login')); }); connected = false; notice('实时连接中断，正在重连；不会切换为模拟模型。', true); controls(); };
     } catch (error) { if (current === generation) { connected = false; notice(error.message, true); controls(); } }
   }
-  $('voiceprints-link').addEventListener('click', () => { location.assign(api('/voiceprints.html')); });
+  function showSettings(panel) {
+    for (const button of document.querySelectorAll('[data-settings-panel]')) {
+      const selected = button.dataset.settingsPanel === panel;
+      if (selected) button.setAttribute('aria-current', 'true');
+      else button.removeAttribute('aria-current');
+      document.getElementById(`settings-${button.dataset.settingsPanel}`).hidden = !selected;
+    }
+    const dialog = $('model-settings');
+    if (!dialog.open) dialog.showModal();
+    if (panel === 'voiceprint') document.dispatchEvent(new Event('voiceprints-refresh'));
+  }
+  function settingText(id, text) { $(id).textContent = text || '—'; }
+  function renderServiceSettings(value) {
+    const embedding = value.context?.embedding;
+    const memory = value.context?.memoryModel;
+    settingText('embedding-mode', embedding?.configured ? embedding.mode : '未配置');
+    settingText('embedding-model', embedding?.model);
+    settingText('embedding-url', embedding?.mode === '本地' ? '本机模型' : embedding?.baseURL);
+    settingText('memory-model', memory?.configured ? memory.model : '未配置');
+    settingText('memory-url', memory?.baseURL);
+    settingText('volcano-status', value.sound2text?.configured ? '已配置' : '未配置');
+    settingText('volcano-resource', value.sound2text?.resourceId);
+    settingText('volcano-endpoint', value.sound2text?.endpoint);
+  }
+  $('open-settings').addEventListener('click', () => showSettings('llm'));
+  document.querySelector('.settings-nav').addEventListener('click', event => {
+    const button = event.target.closest('[data-settings-panel]');
+    if (button) showSettings(button.dataset.settingsPanel);
+  });
   $('close-settings').addEventListener('click', () => $('model-settings').close());
   $('model-form').addEventListener('input', () => { formDirty = true; });
   $('model-form').addEventListener('submit', async event => {

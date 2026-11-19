@@ -123,6 +123,18 @@ export function loadHindsightConfig(env = {}) {
   return { enabled, configured: true, port, llm: { baseURL: daemonEnv.HINDSIGHT_API_LLM_BASE_URL, model }, embedding: embeddingURL ? 'remote' : 'local', reranker: rerankerURL ? 'remote' : 'local', daemonEnv };
 }
 
+/** Browser-safe view. Never includes API keys or the daemon environment. */
+export function publicServiceSettings(config) {
+  if (!config?.configured) {
+    const empty = { configured: false, model: '', baseURL: '', hasApiKey: false };
+    return { memoryModel: empty, embedding: { ...empty, mode: '未配置' } };
+  }
+  const key = config.daemonEnv?.HINDSIGHT_API_LLM_API_KEY;
+  const memoryModel = { configured: true, model: config.llm?.model || '', baseURL: config.llm?.baseURL || '', hasApiKey: Boolean(key && key !== 'none') };
+  if (config.embedding !== 'remote') return { memoryModel, embedding: { configured: true, mode: '本地', model: LOCAL_EMBEDDING_MODEL, baseURL: '', hasApiKey: false } };
+  return { memoryModel, embedding: { configured: true, mode: '远程', model: config.daemonEnv?.HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL || '', baseURL: config.daemonEnv?.HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL || '', hasApiKey: Boolean(config.daemonEnv?.HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY) } };
+}
+
 function anySignal(signals) {
   const list = signals.filter(Boolean);
   return list.length > 1 ? AbortSignal.any(list) : list[0];

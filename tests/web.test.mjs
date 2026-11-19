@@ -23,8 +23,14 @@ test('state accepts explicit unconfigured mode and requires actual DSH events', 
   assert.throws(() => ui.validateState({ ...state(), mode: 'automatic-mock' }), /状态/);
   assert.throws(() => ui.validateState({ ...state(), modelConfig: {} }), /配置/);
 });
-test('interaction page has no settings entry or toolbar', () => {
-  assert.doesNotMatch(html + app, /open-settings/);
+test('interaction row stays free of settings; the corner opens them', () => {
+  assert.match(html, /id="open-settings"/);
+  assert.match(html, /aria-label="设置"/);
+  assert.doesNotMatch(html, /id="voiceprints-link"/);
+  assert.match(html, /id="settings-llm"/);
+  assert.match(html, /id="settings-embedding"/);
+  assert.match(html, /id="settings-volcano"/);
+  assert.match(html, /id="settings-voiceprint"/);
   assert.doesNotMatch(html, /class="toolbar"/);
   assert.equal(ui.outputContent(state()).text, '请先在 .env 中配置模型并重启应用。');
   const ready = state(); ready.modelConfig = config(true);
@@ -54,9 +60,13 @@ test('output and control/stream/Router row, Context row, and separate traces use
   assert.match(css, /\.dsh-view \{[^}]*font-size:16px[^}]*--dsh-content-font-size:16px/);
   assert.match(css, /\.speaker-role \{[^}]*font-size:16px/);
   assert.match(css, /\.output-status \{[^}]*font-size:16px/);
+  assert.match(css, /\.output-clock \{[^}]*font-size:20px/);
   assert.match(css, /\.panel-heading \{[^}]*min-height:49px; padding:12px 17px/);
   assert.doesNotMatch(css, /\.output-status \{[^}]*(?:min-height|padding)\s*:/);
-  assert.match(css, /\.battery-icon \{[^}]*width:2cap[^}]*height:1cap/);
+  assert.match(css, /\.battery-icon \{[^}]*width:36px[^}]*height:18px/);
+  assert.equal((html.match(/class="battery-bar"/g) || []).length, 4);
+  assert.doesNotMatch(css, /#8bc99c/);
+  assert.doesNotMatch(css, /\.output-text \{[^}]*text-shadow/);
   assert.match(css, /\.thinking::before \{[^}]*width:1em[^}]*height:1em/);
   assert.ok(html.indexOf('id="output-title"') < html.indexOf('id="input-title"'));
   const lab = html.slice(html.indexOf('<div class="lab-grid">'), html.indexOf('<div class="context-row">'));
@@ -127,6 +137,14 @@ test('Context System Trace shows readable events with full details available sep
   assert.equal(summary.label, '提交 Hindsight');
   assert.match(summary.detail, /stream-2026-11-19/);
   assert.equal(summary.at, event.at);
+  const read = ui.contextTraceSummary({ type: 'memory.read', at: event.at, data: { injected: '## 用户档案\n用户喜欢短句。', userPrompt: '## 用户指令\n总结会议' } });
+  assert.equal(read.label, '读取并注入 Router');
+  assert.match(read.detail, /用户喜欢短句/);
+  assert.match(read.content, /用户档案/);
+  const write = ui.contextTraceSummary({ type: 'retain.request', at: event.at, data: { documentId: 'stream-1', content: '未确认说话人：王磊周五交付原型。' } });
+  assert.equal(write.label, '写入 Hindsight 请求');
+  assert.match(write.detail, /王磊周五交付原型/);
+  assert.equal(write.content, '未确认说话人：王磊周五交付原型。');
 });
 
 test('only Router final answer is presented as interaction result', () => {
@@ -205,6 +223,11 @@ test('output shows the router dialogue, streamed text, then the committed exchan
   assert.deepEqual(plain(ui.agentCard(value)), { text: '正在处理指令', live: true });
   value.busy = false; value.trace = [{ type: 'router.answer', data: { text: '最后一轮。' } }];
   assert.deepEqual(plain(ui.agentCard(value)), { text: '最后一轮。', live: false });
+  value.trace = [{ type: 'router.answer', data: { text: '**说话人 John：你好**' } }];
+  assert.deepEqual(plain(ui.agentCard(value)), { text: '说话人 John：你好', live: false });
+  value.busy = true; value.stream = { text: '**' + '流'.repeat(60) + '**' };
+  assert.equal(ui.agentCard(value).text, '流'.repeat(50));
+  assert.deepEqual(plain(ui.transcriptLines('说话人1：甲\n\n说话人1：乙')), ['说话人1：甲', '说话人1：乙']);
   assert.match(app, /bindTailFollow\(\$\('interaction-window'\)\)/);
   assert.match(app, /bindTailFollow\(\$\('main-panel'\)\)/);
   assert.match(app, /bindTailFollow\(\$\('function-window'\)\)/);
@@ -214,8 +237,17 @@ test('output shows the router dialogue, streamed text, then the committed exchan
   assert.match(html, /id="esc-button"[^>]*>关闭功能面板</);
   assert.doesNotMatch(css, /\.esc-button \{[^}]*width:/);
   assert.match(css, /\.function-panel \{[^}]*width:0/);
-  assert.match(css, /\.output-stage\.is-function \.function-panel \{[^}]*width:200px/);
-  assert.match(css, /\.output-stage\.is-agent \.agent-panel \{[^}]*max-height:160px/);
+  assert.match(css, /\.output-stage\.is-function \.function-panel \{[^}]*width:min\(240px,42%\)/);
+  assert.match(css, /\.agent-panel\[aria-hidden="true"\] \{[^}]*display:none/);
+  assert.doesNotMatch(css, /max-height:160px/);
+  assert.match(css, /\.output-stage \{[^}]*padding:12px 16px 0/);
+  assert.match(css, /\.guide-panel \{[^}]*margin:12px 16px 16px/);
+  assert.match(css, /\.main-text \{[^}]*border-left:2px solid var\(--waveguide-green\)/);
+  assert.match(css, /\.transcript-line\.is-latest \{[^}]*font-weight:600/);
+  assert.match(html, /id="speaker-name"/);
+  assert.match(html, /id="speaker-card-title">社交卡片</);
+  assert.match(app, /\$\('speaker-card-title'\)\.textContent = '社交卡片'/);
+  assert.match(app, /is-latest/);
   assert.match(css, /\.output-panel \{[^}]*width:640px[^}]*height:480px/);
   assert.match(app, /\$\('esc-button'\)\.addEventListener\('click'/);
   assert.match(app, /event\.key !== 'Escape'/);

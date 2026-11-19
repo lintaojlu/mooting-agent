@@ -61,6 +61,8 @@ test('voiceprint directory strips embeddings, matches the newest 50, and blocks 
   assert.equal(calls.some(call => call.Action === 0 && call.AudioUrl === 'https://example.com/a.wav'), true);
   assert.equal(JSON.stringify(calls).includes('secret'), false);
   assert.equal(VOICEPRINT_LIMIT, 50);
+  const aliased = new VoiceprintDirectory({ apiKey: 'secret', fetchImpl: async () => ({ ok: true, json: async () => ({ Result: { Code: 1000, TotalCount: 0, AudioEmbedding: [], SpeakID: 'from-speak-id' } }) }) });
+  assert.deepEqual(await aliased.register({ name: 'Nil', audioUrl: 'https://example.com/a.wav' }), { id: 'from-speak-id', name: 'Nil' });
 });
 
 test('hosted registration audio expires and the management routes do not return embeddings', async t => {

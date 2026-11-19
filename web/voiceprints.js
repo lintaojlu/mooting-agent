@@ -188,5 +188,6 @@
       await load();
     } catch (error) { status(error.message, true); }
   });
+  document.addEventListener('voiceprints-refresh', () => { load().catch(error => status(error.message, true)); });
   load().catch(error => status(error.message, true));
 }(window));

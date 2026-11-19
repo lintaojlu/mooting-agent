@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { appendFile, chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { MENTAL_MODELS, MemoryUnavailableError } from './hindsight.mjs';
+import { MENTAL_MODELS, MemoryUnavailableError, publicServiceSettings } from './hindsight.mjs';
 
 const UTTERANCE_LIMIT = 8000;
 const FRAGMENT_RAM = 400;
@@ -184,6 +184,7 @@ export class ContextSystem extends EventEmitter {
       }).map(item => ({ at: item.at, text: item.text })),
       status: service.status === 'ready' ? (this.flushing ? 'updating' : 'idle') : service.status,
       configured: !['unconfigured', 'disabled'].includes(service.status),
+      ...publicServiceSettings(this.bridge?.config),
       service,
       outbox: this.items.length + this.batches.reduce((sum, batch) => sum + (batch.count ?? 1), 0),
       models, cachedAt: this.cache.fetchedAt,
@@ -335,6 +336,11 @@ export class ContextSystem extends EventEmitter {
       if (this.routerBusy && !force) { this.flushWanted = true; break; }
       if (explicitOnly && batch.kind !== 'explicit') continue;
       this.currentBatch = batch.documentId;
+      this.traceEvent('outbox.read', {
+        kind: batch.kind, documentId: batch.documentId, operationId: batch.submitted ?? batch.operationId,
+        content: batch.content, context: batch.context, timestamp: batch.timestamp,
+        updateMode: batch.updateMode, tags: batch.tags, submitted: !!batch.submitted,
+      });
       // One in-flight append per daily document preserves ordering and avoids concurrent read/modify/write.
       if (this.batches.slice(0, this.batches.indexOf(batch)).some(item => item.documentId === batch.documentId)) { this.scheduleRetry({ pending: true }); continue; }
       if (this.forgotten(batch.content)) {
@@ -350,7 +356,7 @@ export class ContextSystem extends EventEmitter {
       if (batch.submitted) {
         this.traceEvent('retain.check', { documentId: batch.documentId, operationId: batch.submitted });
         const operation = await this.bridge.operation(batch.submitted);
-        this.traceEvent('retain.status', { documentId: batch.documentId, operationId: batch.submitted, status: operation.status, error: operation.error_message });
+        this.traceEvent('retain.status', { documentId: batch.documentId, operationId: batch.submitted, content: batch.content, status: operation.status, error: operation.error_message, response: operation });
         if (operation.status === 'failed') {
           await this.bridge.retryOperation(batch.submitted);
           this.error = '记忆抽取失败，已提交重试';
@@ -359,13 +365,18 @@ export class ContextSystem extends EventEmitter {
         }
         if (operation.status !== 'completed') { this.scheduleRetry({ pending: true }); continue; }
       } else {
+        this.traceEvent('retain.request', {
+          kind: batch.kind, documentId: batch.documentId, operationId: batch.operationId,
+          content: batch.content, context: batch.context, timestamp: batch.timestamp,
+          updateMode: batch.updateMode, tags: batch.tags, async: !batch.sync,
+        });
         const response = await this.bridge.retain(batch.content, {
           documentId: batch.documentId, timestamp: batch.timestamp, context: batch.context,
           ...(batch.updateMode ? { updateMode: batch.updateMode } : {}),
           ...(batch.tags ? { tags: batch.tags } : {}),
           ...(batch.sync ? { async: false } : { async: true, operationId: batch.operationId }),
         }, { timeoutMs: batch.sync ? 60_000 : 15_000 });
-        this.traceEvent('retain.submitted', { kind: batch.kind, documentId: batch.documentId, operationId: response.operation_id ?? batch.operationId, count: batch.count, async: !batch.sync, updateMode: batch.updateMode });
+        this.traceEvent('retain.submitted', { kind: batch.kind, documentId: batch.documentId, operationId: response.operation_id ?? batch.operationId, count: batch.count, async: !batch.sync, updateMode: batch.updateMode, content: batch.content, response });
         if (!batch.sync && response.operation_id && this.bridge.operation) {
           batch.submitted = response.operation_id;
           await this.saveOutbox({ durable: true });
@@ -375,7 +386,7 @@ export class ContextSystem extends EventEmitter {
       }
       this.batches = this.batches.filter(item => item !== batch);
       sent += batch.count ?? 1;
-      this.traceEvent('retain.completed', { documentId: batch.documentId, kind: batch.kind, operationId: batch.submitted ?? batch.operationId, count: batch.count });
+      this.traceEvent('retain.completed', { documentId: batch.documentId, kind: batch.kind, operationId: batch.submitted ?? batch.operationId, count: batch.count, content: batch.content });
       await this.saveOutbox({ durable: true });
     }
     if (!this.batches.length) { this.error = undefined; this.retryDelay = 5_000; }

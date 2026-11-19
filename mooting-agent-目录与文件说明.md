@@ -73,7 +73,7 @@ MootingAgent 是一个单 Session 原型：复用 DSH 的 Cordis、Agent、Agent
 
 | 运行路径 | 作用 |
 |---|---|
-| `data/context-trace.jsonl` | Context 本地执行事件的完整历史：定稿、忙闲、批次、Hindsight 操作状态、缓存、检索与回想；访问走鉴权 API，SSE 只带最近 200 条。 |
+| `data/context-trace.jsonl` | Context 本地执行事件完整历史，包含每轮读取的缓存、实际注入文本、user prompt、Hindsight 写入正文和结果等私人内容；访问走鉴权 API，SSE 只带最近 200 条。 |
 | `data/fragments.jsonl` | ASR 定稿原话立即追加到磁盘；RAM 环形缓冲供最近原话读取。 |
 | `data/hindsight-outbox.jsonl` | 待写和已提交但未完成的批次、稳定 operation ID；收到异步受理响应后仍保留，确认 `completed` 后才移除。重启后继续确认或重试。 |
 | `data/memory-cache.json` | 用户档案、人物关系表、进行中事项，每 60 秒拉取；也持久化显式记忆和待执行墓碑，离线删除在服务恢复后先于 retain 重放。 |

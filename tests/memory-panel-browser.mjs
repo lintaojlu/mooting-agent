@@ -77,17 +77,23 @@ try {
   assert.ok(trace.entries.some(entry => entry.type === 'fixture.step' && entry.data.index === 0));
   assert.ok(trace.entries.some(entry => entry.type === 'context.load.ready'));
   assert.ok(trace.entries.some(entry => entry.type === 'turn.queued'));
+  const read = trace.entries.find(entry => entry.type === 'memory.read');
+  assert.ok(read, '需要记录实际缓存读取');
+  assert.match(read.data.injected, /用户档案[\s\S]*用户喜欢简短回复/);
+  assert.match(read.data.userPrompt, /最近1分钟原话[\s\S]*王磊明天/);
   await evaluate(`document.querySelector('#context-trace-view').scrollIntoView()`);
   assert.ok(Number(await evaluate(`document.querySelectorAll('#context-trace-rows tr').length`)) >= trace.entries.length, '完整 Context 轨迹应渲染到独立面板');
+  assert.match(await evaluate(`[...document.querySelectorAll('#context-trace-rows tr')].find(row => row.textContent.includes('读取并注入 Router'))?.textContent || ''`), /用户喜欢简短回复/);
+  const shown = await evaluate(`(() => { const row = [...document.querySelectorAll('#context-trace-rows tr')].find(row => row.textContent.includes('读取并注入 Router')); if (!row) return ''; row.querySelector('summary').click(); return row.querySelector('.context-trace-content')?.textContent || ''; })()`);
+  assert.match(shown, /用户档案[\s\S]*用户喜欢简短回复/);
   assert.equal(await evaluate(`document.querySelector('#trace-title').textContent`), 'Agent Trace');
   // Desktop: Context is its own full-width row, below output/control/Router and above the trace.
   await cdp('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1100, deviceScaleFactor: 1, mobile: false });
   const rows = await evaluate(`(() => { const box = id => { const r = document.getElementById(id).closest('section').getBoundingClientRect(); return { x:r.x, y:r.y, w:r.width, h:r.height }; }; const lab = document.querySelector('.lab-grid').getBoundingClientRect(); return { output:box('output-title'), stream:box('inform-stream-title'), router:box('agent-title'), context:box('context-title'), contextTrace:box('context-trace-title'), trace:box('trace-title'), labW:lab.width, streamTextH:document.getElementById('inform_stream').getBoundingClientRect().height, columns:[...document.querySelectorAll('.context-body > *')].map(e => e.getBoundingClientRect().top) }; })()`);
   assert.ok(rows.stream.y >= rows.output.y && rows.router.y >= rows.stream.y + rows.stream.h - 1, '信息流必须位于 Router 上方');
   assert.ok(rows.streamTextH <= 70, `信息流应更窄：${rows.streamTextH}`);
-  assert.ok(Math.abs(rows.context.w - rows.labW) <= 1, `Context 应占整行：${rows.context.w}/${rows.labW}`);
-  assert.ok(rows.context.y >= Math.max(rows.output.y + rows.output.h, rows.router.y + rows.router.h) - 1, 'Context 应在输出与 Router 所在行之后');
-  assert.ok(rows.contextTrace.y >= rows.context.y + rows.context.h - 1, 'Context System Trace 应在 Context 行之后');
+  assert.equal(rows.context.h, 0, 'Context 面板暂时隐藏');
+  assert.ok(rows.contextTrace.y >= Math.max(rows.output.y + rows.output.h, rows.router.y + rows.router.h) - 1, 'Context System Trace 应在输出与 Router 所在行之后');
   assert.ok(rows.trace.y >= rows.contextTrace.y + rows.contextTrace.h - 1, 'Agent Trace 应在 Context System Trace 之后');
   assert.equal(rows.columns.length, 2);
   assert.ok(rows.columns.every(top => Math.abs(top - rows.columns[0]) <= 1), '桌面宽度下 Context 两块内容应并排');
@@ -97,7 +103,7 @@ try {
   await writeFile(join(root, 'artifacts', 'memory-panel-desktop.png'), Buffer.from(wide.data, 'base64'));
   await cdp('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
   assert.equal(await evaluate('document.documentElement.scrollWidth > window.innerWidth'), false);
-  assert.equal(await evaluate(`(() => { const panel = document.querySelector('.context-panel').getBoundingClientRect(); return ['context-status','context-memory-info'].every(id => { const box = document.getElementById(id).getBoundingClientRect(); return box.height > 0 && box.top >= panel.top && box.bottom <= panel.bottom; }); })()`), true, '记忆状态与积压信息必须在面板中实际可见');
+  assert.equal(await evaluate(`document.querySelector('.context-panel').getBoundingClientRect().height`), 0, 'Context 面板暂时隐藏');
   const screenshot = await cdp('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true });
   await mkdir(join(root, 'artifacts'), { recursive: true });
   await writeFile(join(root, 'artifacts', 'memory-panel.png'), Buffer.from(screenshot.data, 'base64'));

@@ -130,9 +130,14 @@ export class HostedAudio {
   }
 }
 
+function speakId(item) {
+  return item?.SpeakId || item?.SpeakID || '';
+}
+
 function publicItem(item) {
-  if (!item?.SpeakId || item.Status === 2) return null;
-  return { id: String(item.SpeakId), name: String(item.SpeakerName ?? '') };
+  const id = speakId(item);
+  if (!id || item.Status === 2) return null;
+  return { id: String(id), name: String(item.SpeakerName ?? '') };
 }
 
 /** Volcengine voiceprint library. Embeddings never leave this object. */
@@ -169,8 +174,9 @@ export class VoiceprintDirectory {
     const items = await this.listAll();
     if (items.length >= VOICEPRINT_LIMIT) throw fail(`声纹已有 ${items.length} 条，达到 ${VOICEPRINT_LIMIT} 条上限后不能再注册`, 409);
     const result = await this.invoke('UpdateVoiceprint', { Action: 0, SpeakerName: checkSpeakerName(name), AudioUrl: checkAudioUrl(audioUrl) });
-    if (!result.SpeakId) throw fail('声纹服务没有返回声纹 ID', 502);
-    return { id: String(result.SpeakId), name: checkSpeakerName(name) };
+    const id = speakId(result);
+    if (!id) throw fail('声纹服务没有返回声纹 ID', 502);
+    return { id: String(id), name: checkSpeakerName(name) };
   }
   async rename({ id, name }) {
     if (!id) throw fail('缺少声纹 ID');

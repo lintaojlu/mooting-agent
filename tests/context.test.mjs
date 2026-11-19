@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { ContextSystem, composeUserPrompt, commandFromPrompt, memoryCommand, LIMITS, MEMORY_NOTE } from '../src/context/index.mjs';
-import { loadHindsightConfig, HindsightBridge } from '../src/context/hindsight.mjs';
+import { loadHindsightConfig, HindsightBridge, publicServiceSettings } from '../src/context/hindsight.mjs';
 import { harness } from './harness.mjs';
 
 const dir = () => mkdtemp(join(tmpdir(), 'mooting-context-'));
@@ -50,6 +50,12 @@ test('hindsight config maps .env, falls back to MOOTING_CONTEXT_* and keeps embe
   assert.equal(own.port, 9100);
   assert.equal(own.daemonEnv.HINDSIGHT_API_EMBEDDINGS_PROVIDER, 'openai');
   assert.equal(own.daemonEnv.HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL, 'emb');
+  const shown = publicServiceSettings({ ...own, daemonEnv: { ...own.daemonEnv, HINDSIGHT_API_LLM_API_KEY: 'secret-key-should-not-leak', HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY: 'secret-key-should-not-leak' } });
+  assert.equal(shown.embedding.mode, '远程');
+  assert.equal(shown.embedding.model, 'emb');
+  assert.equal(shown.embedding.hasApiKey, true);
+  assert.equal(JSON.stringify(shown).includes('secret-key-should-not-leak'), false);
+  assert.equal(publicServiceSettings(config).embedding.mode, '本地');
   assert.equal(own.daemonEnv.HINDSIGHT_API_EMBEDDINGS_OPENAI_DIMENSIONS, '1024');
   assert.equal(loadHindsightConfig({ MOOTING_CONTEXT_BASE_URL: 'https://a/v1', MOOTING_CONTEXT_MODEL: 'a', MOOTING_HINDSIGHT_ENABLED: '0' }).enabled, false);
   assert.throws(() => loadHindsightConfig({ MOOTING_HINDSIGHT_PORT: 'x' }), /PORT/);

@@ -28,7 +28,7 @@ export class Sound2Text {
     this.reloadConfig = config === undefined ? () => loadConfig(configPath) : undefined;
     this.ready = Promise.resolve(config ?? loadConfig(configPath)).then(value => { this.config = { endWindowMs: 800, silenceMs: 1500, noSpeechMs: 10000, maxCommandMs: 60000, finalWaitMs: 3000, url: DEFAULT_URL, ...value }; return this; });
   }
-  state() { return { configured: !!(this.config?.apiKey && this.config?.resourceId), status: this.status, text: this.text, utterances: structuredClone(this.utterances), audioMs: this.audioMs, capture: { ...this.capture }, ...(this.voiceprintNotice ? { voiceprintNotice: this.voiceprintNotice } : {}), ...(this.error ? { error: this.error } : {}) }; }
+  state() { return { configured: !!(this.config?.apiKey && this.config?.resourceId), resourceId: this.config?.resourceId || '', endpoint: this.config?.url || '', status: this.status, text: this.text, utterances: structuredClone(this.utterances), audioMs: this.audioMs, capture: { ...this.capture }, ...(this.voiceprintNotice ? { voiceprintNotice: this.voiceprintNotice } : {}), ...(this.error ? { error: this.error } : {}) }; }
   changed() { this.events.emit('change', this.state()); }
   subscribe(listener) { this.events.on('change', listener); return () => this.events.off('change', listener); }
   fail(error) {

@@ -39,6 +39,29 @@ test('Context trace persists complete history while state sends only a bounded l
   await context.dispose(); await loaded.dispose();
 });
 
+test('write trace records exact retained content and read trace survives restart', async () => {
+  const directory = await root();
+  const calls = [];
+  const bridge = offlineBridge({ ready: true, status: 'ready', async retain(content, options) { calls.push({ content, options }); return {}; } });
+  const context = new ContextSystem({ dataRoot: directory, bridge });
+  await context.ready;
+  context.observe({ status: 'running', utterances: [utter('王磊周五交付原型。')] });
+  await context.flush({ reason: 'test' });
+  await context.idle();
+  const entries = await context.traceHistory();
+  const request = entries.find(entry => entry.type === 'retain.request');
+  const response = entries.find(entry => entry.type === 'retain.submitted');
+  assert.equal(request.data.content, calls[0].content);
+  assert.match(request.data.content, /王磊周五交付原型/);
+  assert.equal(request.data.documentId, calls[0].options.documentId);
+  assert.equal(response.data.content, calls[0].content);
+  assert.ok(entries.some(entry => entry.type === 'outbox.read' && entry.data.content === calls[0].content));
+  const restarted = new ContextSystem({ dataRoot: directory });
+  await restarted.ready;
+  assert.equal((await restarted.traceHistory()).find(entry => entry.seq === request.seq).data.content, calls[0].content);
+  await context.dispose(); await restarted.dispose();
+});
+
 test('deleting the final memory still produces a replacement snapshot', async () => {
   const context = new ContextSystem({ dataRoot: await root() });
   await context.ready;

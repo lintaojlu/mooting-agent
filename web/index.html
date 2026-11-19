@@ -13,28 +13,83 @@
   <script src="dsh-views.js" defer></script>
   <script src="audio-capture.js" defer></script>
   <script src="app.js" defer></script>
+  <script src="voiceprints.js" defer></script>
 </head>
 <body>
   <main class="workspace">
     <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
     <dialog id="model-settings" class="settings-dialog" aria-labelledby="settings-title">
       <header class="settings-header"><h2 id="settings-title">设置</h2><button id="close-settings" class="text-button" type="button" aria-label="关闭设置">关闭</button></header>
-      <div class="settings-section-title"><h3>模型配置</h3><span id="config-status" class="muted">未配置</span></div>
-      <p class="protocol-note">协议：Responses API · POST /responses</p>
-      <form id="model-form" class="settings-body">
-        <fieldset><legend>Router</legend><div class="config-grid">
-          <label>Base URL<input id="router-base-url" type="url" placeholder="http://127.0.0.1:8000/v1" required></label>
-          <label>模型名称<input id="router-model" type="text" placeholder="模型 ID" required></label>
-          <label>API Key<input id="router-api-key" type="password" autocomplete="new-password" placeholder="无密钥可留空"></label>
-        </div></fieldset>
-        <div class="submit-row"><span class="field-help">密钥不会回填；留空保留已有密钥。保存配置不代表连接已验证。</span><button id="save-model" class="secondary-button" type="submit">保存配置</button></div>
-        <p id="config-feedback" class="field-help" role="status"></p>
-      </form>
+      <nav class="settings-nav" aria-label="设置分类">
+        <button type="button" data-settings-panel="llm" aria-current="true">LLM</button>
+        <button type="button" data-settings-panel="embedding">Embedding</button>
+        <button type="button" data-settings-panel="volcano">火山</button>
+        <button type="button" data-settings-panel="voiceprint">声纹</button>
+      </nav>
+      <section id="settings-llm">
+        <div class="settings-section-title"><h3>LLM</h3><span id="config-status" class="muted">未配置</span></div>
+        <p class="protocol-note">协议：Responses API · POST /responses</p>
+        <form id="model-form" class="settings-body">
+          <fieldset><legend>对话模型</legend><div class="config-grid">
+            <label>Base URL<input id="router-base-url" type="url" placeholder="http://127.0.0.1:8000/v1" required></label>
+            <label>模型名称<input id="router-model" type="text" placeholder="模型 ID" required></label>
+            <label>API Key<input id="router-api-key" type="password" autocomplete="new-password" placeholder="无密钥可留空"></label>
+          </div></fieldset>
+          <div class="submit-row"><span class="field-help">密钥不会回填；留空保留已有密钥。保存配置不代表连接已验证。</span><button id="save-model" class="secondary-button" type="submit">保存配置</button></div>
+          <p id="config-feedback" class="field-help" role="status"></p>
+        </form>
+        <div class="settings-section-title"><h3>记忆模型</h3></div>
+        <dl class="settings-facts">
+          <div><dt>模型</dt><dd id="memory-model">—</dd></div>
+          <div><dt>地址</dt><dd id="memory-url">—</dd></div>
+        </dl>
+        <p class="protocol-note">记忆模型写在 .env，修改后需要重启。</p>
+      </section>
+      <section id="settings-embedding" hidden>
+        <div class="settings-section-title"><h3>Embedding</h3></div>
+        <dl class="settings-facts">
+          <div><dt>方式</dt><dd id="embedding-mode">—</dd></div>
+          <div><dt>模型</dt><dd id="embedding-model">—</dd></div>
+          <div><dt>地址</dt><dd id="embedding-url">—</dd></div>
+        </dl>
+        <p class="protocol-note">Embedding 写在 .env，修改后需要重启。密钥只显示是否已填写。</p>
+      </section>
+      <section id="settings-volcano" hidden>
+        <div class="settings-section-title"><h3>火山</h3></div>
+        <dl class="settings-facts">
+          <div><dt>状态</dt><dd id="volcano-status">—</dd></div>
+          <div><dt>资源</dt><dd id="volcano-resource">—</dd></div>
+          <div><dt>地址</dt><dd id="volcano-endpoint">—</dd></div>
+          <div><dt>说话人分离</dt><dd>开启</dd></div>
+        </dl>
+        <p class="protocol-note">火山语音写在 .env，修改后需要重启。密钥不会显示在这里。</p>
+      </section>
+      <section id="settings-voiceprint" hidden>
+        <div class="settings-section-title"><h3>声纹</h3><span id="voiceprint-count" class="muted">0 / 50</span></div>
+        <p id="voiceprint-status" class="protocol-note" role="status"></p>
+        <div class="settings-body">
+          <ul id="voiceprint-list" class="voiceprint-list"></ul>
+          <form id="voiceprint-form" class="voiceprint-form">
+            <label>名称<input id="voiceprint-name" type="text" maxlength="32" required placeholder="例如：张三"></label>
+            <div id="voiceprint-local" class="field-help" hidden>当前是本机访问。请填写一条火山引擎能够下载的公网音频 URL，时长 5–30 秒，wav、pcm 或 mp3。</div>
+            <div id="voiceprint-capture">
+              <div class="voiceprint-actions">
+                <button id="voiceprint-record" type="button">开始录音</button>
+                <label class="file-button">上传音频<input id="voiceprint-file" type="file" accept=".wav,.pcm,.mp3,audio/wav,audio/mpeg,audio/mp3" hidden></label>
+                <span id="voiceprint-clock" class="muted">未录音</span>
+              </div>
+              <p class="field-help">录音或上传 5–30 秒清晰人声。pcm 按 16 kHz、16-bit、单声道计算。</p>
+            </div>
+            <label>公网音频 URL<input id="voiceprint-url" type="url" placeholder="https://example.com/voice.wav"></label>
+            <button id="voiceprint-submit" class="primary-button" type="submit">注册</button>
+          </form>
+        </div>
+      </section>
     </dialog>
     <div class="lab-grid">
-      <section class="panel output-panel" aria-label="输出"><div class="screen"><div class="panel-heading output-status system-bar"><time id="output-date" class="output-date">--/-- 周-</time><span class="system-right"><time id="output-title" class="output-clock">--:--</time><span class="output-battery" title="电量（模拟）"><svg class="battery-icon" viewBox="0 0 28 14" aria-hidden="true" focusable="false"><rect x="0.75" y="0.75" width="22.5" height="12.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M24.2 4.2h1.6a1 1 0 0 1 1 1v3.6a1 1 0 0 1-1 1h-1.6z" fill="currentColor"/><rect x="2.4" y="2.5" width="13.2" height="9" rx="1" fill="currentColor"/></svg></span></span></div><div id="output-stage" class="output-stage"><div class="content-row"><div class="main-column"><div id="agent-panel" class="agent-panel" aria-label="agent panel" aria-hidden="true"><div id="interaction-window" class="interaction-window" aria-live="polite"><p class="agent-label">Agent</p><div id="output-text" class="output-text"></div></div></div><div id="main-panel" class="main-panel" aria-label="main panel"><div id="main-text" class="output-text main-text"></div></div></div><div id="function-panel" class="function-panel" aria-label="function panel" aria-hidden="true"><div id="function-window" class="interaction-window" aria-live="polite"><section id="speaker-card" class="speaker-card" aria-labelledby="speaker-card-title" hidden><h3 id="speaker-card-title">—</h3><div class="speaker-role"><dt>身份</dt><dd id="speaker-identity">—</dd></div><div class="speaker-notes-block"><p class="speaker-notes-label">信息</p><div id="speaker-notes">—</div></div></section></div></div></div></div><footer class="guide-panel" aria-label="guide panel"><span class="guide-key">头部</span><span class="guide-hint">左歪关闭 · 右歪展开</span></footer></div></section>
+      <section class="panel output-panel" aria-label="输出"><div class="screen"><div class="panel-heading output-status system-bar"><time id="output-date" class="output-date">--/-- 周-</time><span class="system-right"><time id="output-title" class="output-clock">--:--</time><span class="output-battery" title="电量（模拟）"><svg class="battery-icon" viewBox="0 0 36 18" aria-hidden="true" focusable="false"><rect x="0.75" y="0.75" width="30.5" height="16.5" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M32.2 5.2h1.7a1.2 1.2 0 0 1 1.2 1.2v5a1.2 1.2 0 0 1-1.2 1.2h-1.7z" fill="currentColor"/><rect class="battery-bar" x="3" y="3.1" width="5.4" height="11.8" rx="0.6" fill="currentColor"/><rect class="battery-bar" x="9.8" y="3.1" width="5.4" height="11.8" rx="0.6" fill="currentColor"/><rect class="battery-bar" x="16.6" y="3.1" width="5.4" height="11.8" rx="0.6" fill="currentColor"/><rect class="battery-bar" x="23.4" y="3.1" width="5.4" height="11.8" rx="0.6" fill="currentColor"/></svg></span></span></div><div id="output-stage" class="output-stage"><div class="content-row"><div class="main-column"><div id="agent-panel" class="agent-panel" aria-label="agent panel" aria-hidden="true"><div id="interaction-window" class="interaction-window" aria-live="polite"><p class="agent-label">Agent</p><div id="output-text" class="output-text"></div></div></div><div id="main-panel" class="main-panel" aria-label="main panel"><div id="main-text" class="output-text main-text"></div></div></div><div id="function-panel" class="function-panel" aria-label="function panel" aria-hidden="true"><div id="function-window" class="interaction-window" aria-live="polite"><section id="speaker-card" class="speaker-card" aria-labelledby="speaker-card-title" hidden><h3 id="speaker-card-title">社交卡片</h3><p id="speaker-name" class="speaker-name">—</p><div class="speaker-role"><dt>身份</dt><dd id="speaker-identity">—</dd></div><div class="speaker-notes-block"><p class="speaker-notes-label">信息</p><div id="speaker-notes">—</div></div></section></div></div></div></div><footer class="guide-panel" aria-label="guide panel"><span class="guide-key">头部</span><span class="guide-hint">左歪关闭 · 右歪展开</span></footer></div></section>
       <div class="side-stack">
-        <section class="panel control-panel" aria-labelledby="input-title"><div class="panel-heading control-heading"><h1 id="input-title">控制面板</h1><button id="audio-toggle" class="audio-toggle" type="button" aria-label="开启语音输入" aria-pressed="false" title="开启语音输入"><svg class="play-symbol" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8 5.5 18 12 8 18.5Z" fill="currentColor"/></svg><svg class="pause-symbol" viewBox="0 0 24 24" aria-hidden="true" focusable="false" hidden><path d="M7 5h3v14H7zm7 0h3v14h-3z" fill="currentColor"/></svg></button></div><div class="panel-body control-actions"><form id="submit-form" novalidate><button id="submit-button" class="primary-button" type="submit" aria-label="右键" disabled>右键</button></form><button id="open-agent" class="esc-button" type="button" aria-label="打开 agent 面板" disabled>打开 agent 面板</button><button id="open-function" class="esc-button" type="button" aria-label="打开功能面板" disabled>打开功能面板</button><button id="close-agent" class="esc-button" type="button" aria-label="关闭 agent panel" disabled>关闭 agent panel</button><button id="esc-button" class="esc-button" type="button" aria-label="关闭功能面板" disabled>关闭功能面板</button><button id="voiceprints-link" class="esc-button" type="button">声纹</button></div></section>
+        <section class="panel control-panel" aria-labelledby="input-title"><div class="panel-heading control-heading"><h1 id="input-title">控制面板</h1><button id="audio-toggle" class="audio-toggle" type="button" aria-label="开启语音输入" aria-pressed="false" title="开启语音输入"><svg class="play-symbol" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8 5.5 18 12 8 18.5Z" fill="currentColor"/></svg><svg class="pause-symbol" viewBox="0 0 24 24" aria-hidden="true" focusable="false" hidden><path d="M7 5h3v14H7zm7 0h3v14h-3z" fill="currentColor"/></svg></button></div><div class="panel-body control-actions"><form id="submit-form" novalidate><button id="submit-button" class="primary-button" type="submit" aria-label="右键" disabled>右键</button></form><button id="open-agent" class="esc-button" type="button" aria-label="打开 agent 面板" disabled>打开 agent 面板</button><button id="open-function" class="esc-button" type="button" aria-label="打开功能面板" disabled>打开功能面板</button><button id="close-agent" class="esc-button" type="button" aria-label="关闭 agent panel" disabled>关闭 agent panel</button><button id="esc-button" class="esc-button" type="button" aria-label="关闭功能面板" disabled>关闭功能面板</button></div></section>
         <section class="panel stream-panel" aria-labelledby="inform-stream-title"><div class="panel-heading"><h2 id="inform-stream-title">信息流</h2></div><div class="inform-stream"><textarea id="inform_stream" rows="2" readonly placeholder="语音识别会显示在这里" aria-labelledby="inform-stream-title"></textarea></div></section>
         <section class="panel router-panel" aria-labelledby="agent-title"><div class="panel-heading"><h2 id="agent-title">Router</h2><span id="agent-status" class="badge">等待输入</span></div><div id="agent-conversation" class="dsh-view"></div><p id="views-error" class="view-error" role="alert" hidden></p></section>
       </div>
@@ -47,5 +102,6 @@
       <section class="panel trace-panel" aria-labelledby="trace-title"><div class="panel-heading"><h2 id="trace-title">Agent Trace</h2><span id="trace-count" class="count">0</span></div><div id="trajectory-view" class="dsh-view"></div><details class="raw-events"><summary>原始事件与任务数据</summary><pre id="raw-events">[]</pre></details></section>
     </div>
   </main>
+  <button id="open-settings" class="settings-launcher" type="button" aria-label="设置" title="设置"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" d="M12 15.2a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4Z"/><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" d="M19.4 13.2a7.8 7.8 0 0 0 .06-1.2 7.8 7.8 0 0 0-.06-1.2l1.9-1.5-1.9-3.3-2.3.9a7.7 7.7 0 0 0-2.1-1.2L14.6 3h-5.2l-.4 2.7a7.7 7.7 0 0 0-2.1 1.2l-2.3-.9-1.9 3.3 1.9 1.5a7.8 7.8 0 0 0 0 2.4l-1.9 1.5 1.9 3.3 2.3-.9a7.7 7.7 0 0 0 2.1 1.2l.4 2.7h5.2l.4-2.7a7.7 7.7 0 0 0 2.1-1.2l2.3.9 1.9-3.3-1.9-1.5Z"/></svg></button>
 </body>
 </html>

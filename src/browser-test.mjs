@@ -49,7 +49,7 @@ try {
   await cdp.until(`document.querySelector('#audio-toggle') && !document.querySelector('#audio-toggle').disabled`);
   assert.equal(await cdp.evaluate(`document.querySelector('#submit-button').disabled`), true);
   assert.equal(await cdp.evaluate(`document.querySelector('#model-settings').open`), false);
-  assert.equal(await cdp.evaluate(`document.querySelector('#open-settings') === null && document.querySelector('.toolbar') === null`), true);
+  assert.equal(await cdp.evaluate(`document.querySelector('#open-settings') !== null && document.querySelector('.toolbar') === null && document.querySelector('#voiceprints-link') === null`), true);
   await cdp.evaluate(`document.querySelector('#model-settings').showModal()`);
   await cdp.until(`document.querySelector('#model-settings').open`);
   await cdp.evaluate(`document.querySelector('#router-base-url').value = ${JSON.stringify(fixture.baseURL)}; document.querySelector('#router-model').value = 'browser-router'; document.querySelector('#router-api-key').value = 'fixture-browser-key'; document.querySelector('#save-model').click()`);
@@ -158,7 +158,7 @@ try {
   const speakerBoundary = speakerCapture.sound2text.capture.boundaryMs;
   asr.recognize({ text: '识别面前说话人', start: speakerBoundary + 5, end: speakerBoundary + 400, definite: true });
   await cdp.evaluate(`document.querySelector('#submit-button').click()`);
-  await cdp.until(`!document.querySelector('#speaker-card').hidden && document.querySelector('#speaker-card-title').textContent === 'John'`);
+  await cdp.until(`!document.querySelector('#speaker-card').hidden && document.querySelector('#speaker-card-title').textContent === '社交卡片' && document.querySelector('#speaker-name').textContent === 'John'`);
   assert.equal(await cdp.evaluate(`document.querySelector('#speaker-identity').textContent`), '空间折叠负责人；AI创业者');
   assert.deepEqual(await cdp.evaluate(`[...document.querySelectorAll('#speaker-notes li')].map(item => item.textContent)`), ['上次聊过如何构建高时效性的AgentOS。', '对于新AI终端的出现坚定不移。', '创立了一家人文科技公司“空间折叠”。']);
   assert.equal(await cdp.evaluate(`document.querySelector('#speaker-card').textContent.includes('模拟数据') || document.querySelector('#speaker-card').textContent.includes('按 esc')`), false);

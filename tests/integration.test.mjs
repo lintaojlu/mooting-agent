@@ -97,6 +97,11 @@ test('persisted memory is injected beside the instruction', async t => {
   const memory = users.find(event => event.data.source.kind === 'runtime-context');
   assert.ok(memory, '长期记忆应作为 runtime context 进入会话');
   assert.ok(userText(memory).includes('用户喜欢短句'));
+  const read = (await context.traceHistory()).find(entry => entry.type === 'memory.read');
+  assert.equal(read.data.instruction, '总结会议');
+  assert.match(read.data.cachedModels['user-profile'].content, /用户喜欢短句/);
+  assert.equal(read.data.injected, h.runtime.turnMemory);
+  assert.equal(read.data.userPrompt, userText(command));
 });
 
 test('Context trace endpoint returns the full persisted history while SSE remains bounded', async t => {

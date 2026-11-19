@@ -104,6 +104,7 @@ export class MootingRuntime extends EventEmitter {
       this.pendingReports = this.pendingReports.filter(report => report.user !== user);
       const text = reports.map(report => report.answer ? `问题：${report.query}\n回想结果：${report.answer}` : `问题：${report.query}\n回想失败：${report.error}`).join('\n\n');
       this.turnMemory = this.context ? this.context.compile(reports.map(report => report.query).join('\n'), { includeRecent: false }) : '';
+      this.context?.traceEvent('memory.read', { source: 'reflect-report', query: reports.map(report => report.query).join('\n'), injected: this.turnMemory });
       this.launch({ kind: 'memory_report', id: `report-${reports[0].taskId}`, instruction: `后台记忆回想已完成，请据此简短回答用户之前的问题。\n\n${text}`, report: text, user });
     });
   }
@@ -299,6 +300,15 @@ export class MootingRuntime extends EventEmitter {
       const userPrompt = extractCommand
         ? `## 最近1分钟原话\n${background || input.instruction}\n\n## 待提取指令\n从以上原话中提取最后一个明确、完整的用户指令；找不到就询问，不调用工具。行首「名字：」只表示说话人。`
         : background ? `## 最近1分钟原话\n${background}\n\n## 用户指令\n\`\`\`\n${input.instruction}\n\`\`\`` : input.instruction;
+      context?.traceEvent('memory.read', {
+        inputId: input.id, instruction: input.instruction, recentSpeech: spoken,
+        cachedModels: Object.fromEntries(['user-profile', 'people', 'open-items'].map(id => [id, {
+          content: context.cache.models[id]?.content ?? '', updatedAt: context.cache.models[id]?.updatedAt ?? null,
+          ...(id === 'people' ? { people: context.cache.models[id]?.people ?? [] } : {}),
+        }])),
+        explicit: context.cache.explicit.filter(item => !context.forgotten(item.text)),
+        injected: this.turnMemory, userPrompt,
+      });
       const fragments = background ? transcriptSentences(background).map(text => Object.freeze({ speaker: '未确认', text, kind: 'context', at: input.at })) : null;
       const snapshot = Object.freeze({ ...input, command: input.instruction, userPrompt, user: username || undefined, ...(extractCommand ? { extractCommand: true } : {}), ...(fragments ? { contextText: background, context: Object.freeze(fragments) } : {}) });
       if (username) { this.lastUser = username; this.contextsByUser.set(username, snapshot); this.captureWorkspace(username); }

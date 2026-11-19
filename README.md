@@ -104,7 +104,7 @@ Python 不读取 macOS 系统代理；需要代理下载模型时，设置 `MOOT
 - **每轮输入**：不发网络请求、不调模型，只读内存。最近 **1 分钟内全部定稿原话** 按顺序写进 Router 的 user prompt；按钮收束得到的 command 放在独立「用户指令」节，旧原话不能作为额外授权。旧版不经采集按钮的语音交互会把最近一分钟原话交给 Router，要求它提取最后一个明确、完整的 command；没有指令时不调用工具。长期记忆的用户档案（500 字）、进行中事项（500 字）、相关人物（按姓名和别名命中指令与最近原话，最多 3 人，每人 150 字）仍经 system prompt 注入，不重复塞入原话。三份 mental model（`user-profile`、`people`、`open-items`）每 60 秒拉取一次，存入 `data/memory-cache.json`。面板的「最近原话」只显示最近一分钟内的定稿。
 - **Router 工具（只读）**：`memory_search` 同步召回，3 秒超时返回空结果；`memory_reflect` 在 Worker 后台综合回答，60 秒超时，完成后唤醒 Router 回报。Router 没有写记忆的工具。
 
-Context 面板显示服务状态、outbox 积压、三份 mental model 的更新时间和上次写入结果。独立的 Context System Trace 记录定稿、Router 忙闲、封批、Hindsight 提交及操作状态、缓存刷新、检索与回想、失败和重试；事件持久化在权限受限的 `data/context-trace.jsonl`，页面通过受登录保护的 `/api/context/trace` 读取完整历史，实时状态流只带最近 200 条。它记录本应用 Context 的调用边界，不是 Hindsight Python 守护进程内部逐 token 日志。Agent Trace 保持 DSH 原有的 Router/工具轨迹。会话日志保留历次记忆快照用于追溯；发送给模型时仅投影最新的 `mooting-memory` 快照，避免旧记忆反复累加和被纠正的缓存继续出现。删除最后一条记忆也会生成替换快照，声明旧快照失效。
+Context 面板显示服务状态、outbox 积压、三份 mental model 的更新时间和上次写入结果。独立的 Context System Trace 记录每轮从缓存读取的档案/事项/人物、最近一分钟原话、实际注入 Router 的文本与 user prompt；写入侧记录定稿/回合原文、待写批次、向 Hindsight 发送的完整正文和返回结果，以及后续 operation 状态、缓存刷新、检索与回想、失败和重试。列表直接显示正文摘要，展开可看全文及原始字段。轨迹含私人对话原文，持久化在权限受限的 `data/context-trace.jsonl`，页面通过受登录保护的 `/api/context/trace` 读取完整历史，实时状态流只带最近 200 条；旧版运行期间没有记录正文的事件不能补出正文。它记录本应用 Context 的调用边界，不是 Hindsight Python 守护进程内部逐 token 日志。Agent Trace 保持 DSH 原有的 Router/工具轨迹。会话日志保留历次记忆快照用于追溯；发送给模型时仅投影最新的 `mooting-memory` 快照，避免旧记忆反复累加和被纠正的缓存继续出现。删除最后一条记忆也会生成替换快照，声明旧快照失效。
 
 ## 交互
 
