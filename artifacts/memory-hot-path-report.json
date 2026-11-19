@@ -1,0 +1,7 @@
+{
+  "samples": 500,
+  "compileP95Ms": 1.2441250000000537,
+  "finalizedToReadableP95Ms": 2.0804169999999544,
+  "network": "disabled (bridge absent)",
+  "passed": true
+}

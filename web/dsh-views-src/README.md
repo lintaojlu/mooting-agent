@@ -36,7 +36,7 @@ MootingDSHViews.dispose(container);
 From the demo directory:
 
 ```sh
-node scripts/build-dsh-views.mjs
+node web/build-dsh-views.mjs
 node web/dsh-views-src/smoke.mjs
 ```
 

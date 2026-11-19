@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/vectorize-io/hindsight",
+  "commit": "04698b6a8250615faa80d4871cb738c3df758057",
+  "license": "MIT",
+  "includes": "upstream tracked source only",
+  "excludes": "profile data, embedded Postgres, model caches, virtualenvs, and MootingAgent data/"
+}

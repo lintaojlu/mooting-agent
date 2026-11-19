@@ -18,7 +18,7 @@ import { FakeSound2text } from './fake-sound2text.mjs';
 export async function harness({ adapter = new MockRouterAdapter(), mode = 'mock', realModels = false, configPath, runWorker, sound2text = new FakeSound2text(), context, homes } = {}) {
   const ctx = new Context();
   for (const plugin of [LlmRuntime, SessionStore, SessionProjection, SystemPrompt, Tools, NativeExecutor, AgentRegistry]) await ctx.plugin(plugin);
-  await ctx.plugin(AgentLoop, { agents: [] });
+  await ctx.plugin(AgentLoop, { agents: [], maxParallelToolCalls: 1 });
   if (realModels) { await ctx.plugin(ModelsPlugin, { configPath }); await ctx.mootingModels.ready; }
   else {
     ctx.llm.registerAdapter(['mooting-mock'], adapter);

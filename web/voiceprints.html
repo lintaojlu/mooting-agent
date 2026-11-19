@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="mooting-base" content="%%BASE%%">
+  <base href="%%BASE_HREF%%">
+  <title>声纹管理</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="boot.js"></script>
+  <script src="voiceprints.js" defer></script>
+</head>
+<body>
+  <main class="workspace voiceprint-page">
+    <header class="panel-heading">
+      <h1>声纹</h1>
+      <a class="text-button" href="./">返回</a>
+    </header>
+    <p id="voiceprint-status" class="field-help" role="status"></p>
+    <section class="panel">
+      <div class="panel-heading"><h2>已注册</h2><span id="voiceprint-count" class="muted">0 / 50</span></div>
+      <div class="panel-body"><ul id="voiceprint-list" class="voiceprint-list"></ul></div>
+    </section>
+    <section class="panel">
+      <div class="panel-heading"><h2>注册</h2></div>
+      <form id="voiceprint-form" class="panel-body voiceprint-form">
+        <label>名称<input id="voiceprint-name" type="text" maxlength="32" required placeholder="例如：张三"></label>
+        <div id="voiceprint-local" class="field-help" hidden>当前是本机访问。请填写一条火山引擎能够下载的公网音频 URL，时长 5–30 秒，wav、pcm 或 mp3。</div>
+        <div id="voiceprint-capture">
+          <div class="voiceprint-actions">
+            <button id="voiceprint-record" type="button">开始录音</button>
+            <label class="file-button">上传音频<input id="voiceprint-file" type="file" accept=".wav,.pcm,.mp3,audio/wav,audio/mpeg,audio/mp3" hidden></label>
+            <span id="voiceprint-clock" class="muted">未录音</span>
+          </div>
+          <p class="field-help">录音或上传 5–30 秒清晰人声。pcm 按 16 kHz、16-bit、单声道计算。</p>
+        </div>
+        <label>公网音频 URL<input id="voiceprint-url" type="url" placeholder="https://example.com/voice.wav"></label>
+        <button id="voiceprint-submit" class="primary-button" type="submit">注册</button>
+      </form>
+    </section>
+  </main>
+</body>
+</html>

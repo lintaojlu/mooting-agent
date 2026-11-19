@@ -1,0 +1,18 @@
+{
+  "embedVersion": "1.2.1",
+  "packages": [
+    {
+      "name": "@vectorize-io/hindsight-all",
+      "version": "1.2.1",
+      "tarball": "https://registry.npmjs.org/@vectorize-io/hindsight-all/-/hindsight-all-1.2.1.tgz",
+      "integrity": "sha512-eXggSENW5/Hefuyn0H2rJjLYjmw/nOU1VdOjUvQ+HNlG+sP/tSchk5mt55QxtKx3NJKg01cAa/BXfaBrm3pLew=="
+    },
+    {
+      "name": "@vectorize-io/hindsight-client",
+      "version": "1.2.1",
+      "tarball": "https://registry.npmjs.org/@vectorize-io/hindsight-client/-/hindsight-client-1.2.1.tgz",
+      "integrity": "sha512-Av5Dl5MqvZ1Vx+UMF1i0zVxz4BkCrhM4mg3E0hy2K7n6yUWbWz23OqFGTRAJzqtDLoFji6SmQRMj3TH2/Nig7Q=="
+    }
+  ],
+  "license": "MIT; LICENSE copied from the adjacent Hindsight checkout into both vendored packages"
+}

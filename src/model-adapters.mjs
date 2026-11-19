@@ -1,4 +1,18 @@
 import { LlmAdapter, ToolCallId } from '@deepseek-ai/dsh-llm';
+import { setTimeout as delay } from 'node:timers/promises';
+
+/** Retry one transport disconnect before any response headers/output have reached the agent. */
+async function fetchResponse(endpoint, request) {
+  for (let attempt = 0; ; attempt++) {
+    try { return await fetch(endpoint, request); }
+    catch (error) {
+      const code = error.cause?.code ?? error.code;
+      const transient = ['ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT'].includes(code);
+      if (attempt >= 1 || request.signal.aborted || !transient) throw error;
+      await delay(200, undefined, { signal: request.signal });
+    }
+  }
+}
 
 const LIMIT = 2 * 1024 * 1024;
 const REPLAY = 'mooting-openai-responses-v1';
@@ -7,7 +21,12 @@ function required(value, name) { if (typeof value !== 'string' || !value) throw 
 
 /** Replay native output only on the same route; project portable history on model switches. */
 function inputItems(messages, model, endpoint) {
-  return messages.flatMap(message => {
+  const memorySnapshot = message => message.source?.kind === 'runtime-context' && message.source?.form === 'snapshot' && message.source?.sections?.some(section => section.name === 'mooting-memory');
+  const latestMemory = messages.findLastIndex(memorySnapshot);
+  return messages.flatMap((message, index) => {
+    // DSH persists each changed runtime snapshot for audit; the latest snapshot supersedes
+    // its predecessors. Do not send a growing archive of stale memory to the remote model.
+    if (index < latestMemory && memorySnapshot(message)) return [];
     if (message.role === 'assistant') {
       const replay = message.source?.replayState?.response;
       if (replay?.protocol === REPLAY && replay.model === model && replay.endpoint === endpoint && Array.isArray(replay.output)) return replay.output;
@@ -44,7 +63,7 @@ export class CompatibleRouterAdapter extends LlmAdapter {
     const signal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(45000)]) : AbortSignal.timeout(45000);
     signal.throwIfAborted();
     const tools = (options.tools ?? []).map(tool => ({ type: 'function', name: tool.name, description: tool.description, parameters: tool.parameters, strict: false }));
-    const response = await fetch(this.endpoint, {
+    const response = await fetchResponse(this.endpoint, {
       method: 'POST', headers: { 'Content-Type': 'application/json', ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}) },
       body: JSON.stringify({ model: this.model, input: inputItems(options.messages, this.model, this.endpoint), ...(tools.length ? { tools } : {}), stream: true, max_output_tokens: options.maxTokens ?? 2048, store: false, ...(this.thinking ? {} : { reasoning: { effort: 'none' } }), include: ['reasoning.encrypted_content'] }), signal,
     });

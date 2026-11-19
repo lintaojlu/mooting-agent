@@ -26,6 +26,7 @@ test('account gate and base path protect the public prefix', async t => {
   const web = await startWeb(runtime(), { port: 0, basePath: '/mooting-agent', auth: true, publicHosts: ['nillin.space'] });
   t.after(() => web.close());
   assert.equal((await fetch(web.url + '/mooting-agent/api/state')).status, 401);
+  assert.equal((await fetch(web.url + '/mooting-agent/api/context/trace')).status, 401);
   const page = await fetch(web.url + '/mooting-agent/', { redirect: 'manual' });
   assert.equal(page.status, 302);
   assert.equal(page.headers.get('location'), '/mooting-agent/login');

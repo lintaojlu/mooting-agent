@@ -23,6 +23,49 @@ function send(res, events) { res.writeHead(200, { 'Content-Type': 'text/event-st
 const options = (messages = [{ role: 'user', content: [{ type: 'text', text: '你好' }] }]) => ({ messages, tools: [{ name: 'dispatch_worker', description: '执行任务', parameters: { type: 'object' } }], maxTokens: 512 });
 const collect = adapter => Array.fromAsync(adapter.stream(options()));
 
+test('only the newest Mooting memory snapshot reaches the model while original user history remains', async t => {
+  const { adapter, requests } = await fixture(t, res => send(res, [event('response.completed', { response: complete([textItem()]) })]));
+  const snapshot = text => ({ role: 'user', source: { kind: 'runtime-context', form: 'snapshot', sections: [{ name: 'mooting-memory', text }] }, content: [{ type: 'text', text }] });
+  const messages = [
+    { role: 'user', content: [{ type: 'text', text: '第一条原始指令' }] }, snapshot('旧缓存：王磊是医生'),
+    { role: 'assistant', content: [{ type: 'text', text: '之前的回答' }] },
+    { role: 'user', content: [{ type: 'text', text: '纠正：王磊是产品经理' }] }, snapshot('新缓存：王磊是产品经理'),
+  ];
+  await Array.fromAsync(adapter.stream(options(messages)));
+  const input = JSON.stringify(requests[0].value.input);
+  assert.doesNotMatch(input, /旧缓存/);
+  assert.match(input, /新缓存/);
+  assert.match(input, /第一条原始指令/);
+  assert.match(input, /之前的回答/);
+  assert.equal(messages.length, 5, '日志和传入消息不被修改');
+});
+
+test('one transport disconnect before response headers is retried with the same request', async t => {
+  let attempts = 0;
+  const { adapter, requests } = await fixture(t, res => {
+    if (++attempts === 1) { res.destroy(); return; }
+    send(res, [event('response.completed', { response: complete([textItem('重试成功')]) })]);
+  });
+  const chunks = await collect(adapter);
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[0].value, requests[1].value);
+  assert.equal(chunks.filter(c => c.type === 'text-delta').map(c => c.text).join(''), '重试成功');
+});
+
+test('HTTP errors and disconnects after response headers are not replayed', async t => {
+  const rejected = await fixture(t, res => { res.writeHead(503); res.end('unavailable'); });
+  await assert.rejects(collect(rejected.adapter), /HTTP 503/);
+  assert.equal(rejected.requests.length, 1);
+  const streamed = await fixture(t, res => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.flushHeaders();
+    res.write('data: ' + JSON.stringify(event('response.output_text.delta', { item_id: 'msg-1', content_index: 0, delta: '部分回复' })) + '\n\n');
+    setTimeout(() => res.destroy(), 20);
+  });
+  await assert.rejects(collect(streamed.adapter));
+  assert.equal(streamed.requests.length, 1);
+});
+
 test('Responses request uses /v1/responses and converts role messages, functions and outputs without chat fields', async t => {
   const { adapter, requests } = await fixture(t, res => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(complete([textItem()]))); });
   await Array.fromAsync(adapter.stream(options([

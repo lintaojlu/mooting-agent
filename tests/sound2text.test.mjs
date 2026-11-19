@@ -52,7 +52,7 @@ test('real local cloud socket uses API-key headers, 200ms PCM packets, partial r
   await turn(); await turn(); assert.equal(f.packets.filter(p => p.type === 2)[0].bytes.length, 6400);
   f.send({ text: '红', utterances: [utterance('红', 0, 200, false)] }); await once(f.sound.events, 'text');
   f.send({ text: '红筹', utterances: [utterance('红筹', 0, 300)] }); await once(f.sound.events, 'text');
-  assert.equal(f.sound.state().utterances.length, 1); assert.equal(f.sound.state().text, '红筹'); assert.ok(!JSON.stringify(f.sound.state()).includes('fixture-secret'));
+  assert.equal(f.sound.state().utterances.length, 1); assert.equal(f.sound.state().text, '说话人 1：红筹'); assert.equal(f.sound.state().utterances[0].text, '红筹'); assert.ok(!JSON.stringify(f.sound.state()).includes('fixture-secret'));
   await f.sound.pause(); assert.equal(f.sound.state().status, 'stopped'); assert.equal(f.packets.at(-1).flags, 3);
 });
 
@@ -61,7 +61,7 @@ test('acoustic silence merges stable multi-utterance command and emits exactly o
   sound.armCapture(); sound.pushAudio(pcm(200, true));
   sound.handleResult({ result: { text: '帮我记录明天开会', utterances: [utterance('帮我记录', 0, 100), utterance('明天开会', 100, 200)] } });
   sound.pushAudio(pcm(1500));
-  assert.equal(instructions.length, 1); assert.equal(instructions[0].text, '帮我记录明天开会'); assert.equal(sound.state().capture.status, 'idle');
+  assert.equal(instructions.length, 1); assert.equal(instructions[0].text, '说话人 1：帮我记录\n说话人 1：明天开会'); assert.equal(sound.state().capture.status, 'idle');
   sound.handleResult({ result: { utterances: [utterance('明天开会', 100, 200)] } }); assert.equal(instructions.length, 1);
 });
 
@@ -72,7 +72,7 @@ test('silence waits for final revision, manual end excludes pre-button words', a
   sound.handleResult({ result: { utterances: [utterance('之前之后', 0, 400, false, words)] } }); sound.finishCapture();
   assert.equal(sound.state().capture.status, 'finishing'); assert.equal(instructions.length, 0);
   sound.handleResult({ result: { utterances: [utterance('之前之后', 0, 400, true, words)] } });
-  assert.equal(instructions[0].text, '之后');
+  assert.equal(instructions[0].text, '说话人 1：之后');
 });
 
 test('missing word timing across boundary aborts safely, no incomplete command', async t => {
@@ -111,7 +111,7 @@ test('sample checkpoints handle future PCM and past transport arrival without pr
   sound.pushAudio(pcm(200, true)); sound.finishCapture('manual', 500);
   sound.handleResult({ result: { utterances: [utterance('之前之后', 0, 500, true, [{ text: '之前', start_time: 0, end_time: 190 }, { text: '之后', start_time: 210, end_time: 490 }])] } });
   assert.equal(instructions.length, 0); sound.pushAudio(pcm(100));
-  assert.equal(instructions[0].text, '之后'); assert.equal(instructions[0].reason, 'manual');
+  assert.equal(instructions[0].text, '说话人 1：之后'); assert.equal(instructions[0].reason, 'manual');
   sound.pushAudio(pcm(100, true)); sound.armCapture(550); assert.equal(sound.capture.heardSpeech, true);
   assert.equal(sound.capture.lastVoiceMs, 600); sound.cancelCapture();
   assert.throws(() => sound.armCapture(sound.audioMs + 8001), /边界/); assert.throws(() => sound.armCapture(-1), /边界/);
@@ -197,7 +197,7 @@ test('confirm may lead in-flight audio, and a definite command survives a longer
   sound.pushAudio(pcm(1000));
   assert.equal(instructions.length, 0, 'acoustic tail beyond the transcript must wait for the deadline');
   t.mock.timers.tick(4000);
-  assert.equal(instructions.length, 1); assert.equal(instructions[0].text, '打开字幕');
+  assert.equal(instructions.length, 1); assert.equal(instructions[0].text, '说话人 1：打开字幕');
   t.mock.timers.reset();
 });
 
@@ -208,7 +208,7 @@ test('shifted final timestamps replace drafts and unblock a complete command exa
   sound.handleResult({ result: { utterances: [utterance('总结一下刚才的观', 100, 900, false)] } });
   sound.finishCapture(); assert.equal(instructions.length, 0);
   sound.handleResult({ result: { utterances: [utterance('总结一下刚才的观点。', 80, 1000)] } });
-  assert.equal(instructions.length, 1); assert.equal(instructions[0].text, '总结一下刚才的观点。');
+  assert.equal(instructions.length, 1); assert.equal(instructions[0].text, '说话人 1：总结一下刚才的观点。');
   assert.equal(sound.capture.status, 'idle'); assert.equal(sound.utterances.length, 1);
   sound.handleResult({ result: { utterances: [utterance('迟到的旧草稿', 100, 1050, false)] } });
   assert.equal(sound.utterances.length, 1); assert.equal(sound.utterances[0].definite, true);
@@ -226,7 +226,7 @@ test('shifted drafts and split finals preserve neighboring sentences and wait fo
   sound.handleResult({ result: { utterances: [utterance('总结一下', 0, 400), utterance('刚才的观', 420, 900, false)] } });
   assert.equal(instructions.length, 0); assert.equal(sound.capture.status, 'finishing');
   sound.handleResult({ result: { utterances: [utterance('刚才的观点。', 400, 1000)] } });
-  assert.equal(instructions[0].text, '总结一下刚才的观点。'); assert.equal(sound.utterances.length, 2);
+  assert.equal(instructions[0].text, '说话人 1：总结一下\n说话人 1：刚才的观点。'); assert.equal(sound.utterances.length, 2);
 });
 
 test('revised start across the button boundary still excludes background words', async t => {
@@ -238,5 +238,34 @@ test('revised start across the button boundary still excludes background words',
   sound.handleResult({ result: { utterances: [utterance('背景总结一下刚才的观点', 0, 1000, true, [
     { text: '背景', start_time: 0, end_time: 190 }, { text: '总结一下刚才的观点', start_time: 220, end_time: 1000 },
   ])] } });
-  assert.equal(instructions.length, 1); assert.equal(instructions[0].text, '总结一下刚才的观点');
+  assert.equal(instructions.length, 1); assert.equal(instructions[0].text, '说话人 1：总结一下刚才的观点');
+});
+
+test('a definite utterance without start_time stays beside the next speaker', async () => {
+  const sound = new Sound2Text({ config: { apiKey: 'x', resourceId: 'x' } });
+  await sound.ready;
+  sound.handleResult({ result: { utterances: [
+    { text: '第一句。', end_time: 1000, definite: true, additions: { speaker_id: '1' } },
+    { text: '第二句。', start_time: 1200, end_time: 2000, definite: true, additions: { speaker_id: '2' } },
+  ] } });
+  assert.equal(sound.state().text, '说话人 1：第一句。\n说话人 2：第二句。');
+});
+
+test('live stream enables speaker separation and keeps going when the voiceprint list fails', async t => {
+  const failed = await fixture(t);
+  failed.sound.loadVoiceprints = async () => { throw new Error('声纹库不可用'); };
+  await failed.sound.start();
+  const failedInit = JSON.parse(failed.packets[0].bytes.toString('utf8'));
+  assert.equal(failedInit.request.enable_speaker_info, true);
+  assert.equal(failedInit.request.voiceprints, undefined);
+  assert.equal(failed.sound.state().voiceprintNotice, '这次没有声纹匹配');
+  const matched = await fixture(t);
+  matched.sound.loadVoiceprints = async () => ['vp-new', 'vp-new', 'vp-old'];
+  await matched.sound.start();
+  const init = JSON.parse(matched.packets[0].bytes.toString('utf8'));
+  assert.deepEqual(init.request.voiceprints, [{ id: 'vp-new' }, { id: 'vp-old' }]);
+  matched.send({ utterances: [{ text: '你好', start_time: 0, end_time: 80, definite: false, additions: { speaker_id: '2' } }, { text: '我到了', start_time: 90, end_time: 160, definite: true, speaker_id: '张三' }] });
+  await once(matched.sound.events, 'text');
+  assert.equal(matched.sound.state().text, '说话人 2：你好\n张三：我到了');
+  assert.equal(matched.sound.state().utterances[1].text, '我到了');
 });

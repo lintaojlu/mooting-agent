@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import WebSocket from 'ws';
 import { AUDIO_BYTES_PER_MS, AUDIO_PACKET_BYTES, encodeRequest, decodeResponse, createInitPayload } from './protocol.mjs';
+import { readSpeakerId, speakerLabel, speakerLine } from './speaker-label.mjs';
 
 export const DEFAULT_URL = 'wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async';
 function number(value, fallback, min, max, name) { const n = value === undefined || value === '' ? fallback : Number(value); if (!Number.isFinite(n) || n < min || n > max) throw new Error(`sound2text ${name} 配置无效`); return n; }
@@ -19,14 +20,15 @@ export async function loadConfig(path = process.env.MOOTING_HOME ? join(process.
 
 /** Shared ASR stream and server-authoritative command capture. No credential enters public state. */
 export class Sound2Text {
-  constructor({ config, configPath, WebSocketImpl = WebSocket, now = () => Date.now(), rmsThreshold = .012 } = {}) {
+  constructor({ config, configPath, WebSocketImpl = WebSocket, now = () => Date.now(), rmsThreshold = .012, loadVoiceprints } = {}) {
     this.events = new EventEmitter(); this.events.on('error', () => {});
     this.WebSocketImpl = WebSocketImpl; this.now = now; this.rmsThreshold = rmsThreshold;
     this.status = 'stopped'; this.text = ''; this.utterances = []; this.audioMs = 0; this.pending = Buffer.alloc(0); this.recentAudio = []; this.capture = { status: 'idle' }; this.owner = null;
+    this.loadVoiceprints = loadVoiceprints; this.voiceprintNotice = '';
     this.reloadConfig = config === undefined ? () => loadConfig(configPath) : undefined;
     this.ready = Promise.resolve(config ?? loadConfig(configPath)).then(value => { this.config = { endWindowMs: 800, silenceMs: 1500, noSpeechMs: 10000, maxCommandMs: 60000, finalWaitMs: 3000, url: DEFAULT_URL, ...value }; return this; });
   }
-  state() { return { configured: !!(this.config?.apiKey && this.config?.resourceId), status: this.status, text: this.text, utterances: structuredClone(this.utterances), audioMs: this.audioMs, capture: { ...this.capture }, ...(this.error ? { error: this.error } : {}) }; }
+  state() { return { configured: !!(this.config?.apiKey && this.config?.resourceId), status: this.status, text: this.text, utterances: structuredClone(this.utterances), audioMs: this.audioMs, capture: { ...this.capture }, ...(this.voiceprintNotice ? { voiceprintNotice: this.voiceprintNotice } : {}), ...(this.error ? { error: this.error } : {}) }; }
   changed() { this.events.emit('change', this.state()); }
   subscribe(listener) { this.events.on('change', listener); return () => this.events.off('change', listener); }
   fail(error) {
@@ -42,6 +44,14 @@ export class Sound2Text {
     if (this.reloadConfig) this.config = await this.reloadConfig();
     if (!this.state().configured) { this.error = '请先填写 SOUND2TEXT_API_KEY 和 SOUND2TEXT_RESOURCE_ID'; this.changed(); throw new Error(this.error); }
     const url = new URL(this.config.url); if (!['ws:', 'wss:'].includes(url.protocol)) throw new Error('sound2text WS_URL 无效');
+    this.voiceprintNotice = '';
+    let voiceprints = [];
+    if (this.loadVoiceprints) {
+      try {
+        const loaded = await Promise.race([Promise.resolve(this.loadVoiceprints()), new Promise((_, reject) => setTimeout(() => reject(new Error('声纹库超时')), 8000))]);
+        voiceprints = Array.isArray(loaded) ? loaded : [];
+      } catch { this.voiceprintNotice = '这次没有声纹匹配'; voiceprints = []; }
+    }
     this.owner = owner ?? this.owner; this.error = undefined; this.status = 'connecting'; this.text = ''; this.utterances = []; this.audioMs = 0; this.pending = Buffer.alloc(0); this.recentAudio = []; this.sequence = 1; this.changed();
     const socket = this.socket = new this.WebSocketImpl(this.config.url, { headers: { 'X-Api-Key': this.config.apiKey, 'X-Api-Resource-Id': this.config.resourceId, 'X-Api-Request-Id': randomUUID() }, maxPayload: 2 * 1024 * 1024, handshakeTimeout: 10000 });
     socket.on('message', (data, binary) => { if (this.socket !== socket) return; try { if (!binary) throw new Error('ASR 返回非二进制消息'); const packet = decodeResponse(data); if (packet.code) throw new Error(`ASR 服务错误 ${packet.code}`); if (packet.data?.code && packet.data.code !== 20000000 && packet.data.code !== 1000) throw new Error(`ASR 服务错误 ${packet.data.code}`); this.initialResolve?.(); this.handleResult(packet.data); if (packet.terminal) { this.terminalResolve?.(); if (this.status === 'running') this.fail(new Error('ASR 流已结束，请重新开启语音输入')); } } catch (error) { this.fail(error); } });
@@ -60,7 +70,7 @@ export class Sound2Text {
       await new Promise((resolve, reject) => { const timer = setTimeout(() => reject(new Error('ASR 连接超时')), 10000); socket.once('open', () => { clearTimeout(timer); resolve(); }); socket.once('error', error => { clearTimeout(timer); reject(new Error(this.error ?? `ASR 连接失败：${error.code ?? error.message}`)); }); socket.once('close', () => { clearTimeout(timer); reject(new Error('ASR 连接已关闭')); }); });
       let initialTimer;
       const initialized = new Promise((resolve, reject) => { this.initialResolve = resolve; this.initialReject = reject; initialTimer = setTimeout(() => reject(new Error('ASR 初始化响应超时')), 10000); });
-      socket.send(encodeRequest(createInitPayload(this.config.endWindowMs), this.sequence++));
+      socket.send(encodeRequest(createInitPayload(this.config.endWindowMs, voiceprints), this.sequence++));
       try { await initialized; } finally { clearTimeout(initialTimer); this.initialResolve = undefined; this.initialReject = undefined; }
       if (this.status === 'error') throw new Error(this.error);
       if (this.socket !== socket || this.status !== 'connecting') throw new Error('ASR 启动已中止');
@@ -110,9 +120,14 @@ export class Sound2Text {
   handleResult(data) {
     const result = data?.result; if (!result) return;
     const incoming = Array.isArray(result.utterances) ? result.utterances : [];
+    let cursor = 0;
     for (const u of incoming) {
-      if (typeof u.text !== 'string' || !Number.isFinite(u.start_time) || !Number.isFinite(u.end_time) || u.start_time < 0 || u.end_time < u.start_time) continue;
-      const normalized = { text: u.text.slice(0, 16000), start_time: u.start_time, end_time: u.end_time, definite: u.definite === true, words: Array.isArray(u.words) ? u.words.slice(0, 2000) : [] };
+      // The live API omits start_time on the first utterance of a result. Keep it at the previous end.
+      const start = Number.isFinite(u.start_time) ? u.start_time : cursor;
+      const end = Number.isFinite(u.end_time) ? u.end_time : start;
+      if (typeof u.text !== 'string' || start < 0 || end < start) continue;
+      cursor = Math.max(cursor, end);
+      const normalized = { text: u.text.slice(0, 16000), speaker: speakerLabel(readSpeakerId(u)), start_time: start, end_time: end, definite: u.definite === true, words: Array.isArray(u.words) ? u.words.slice(0, 2000) : [] };
       const overlaps = entry => entry.start_time === normalized.start_time || (entry.start_time < normalized.end_time && normalized.start_time < entry.end_time);
       // ASR may adjust start times when revising or finalizing a segment. A final
       // segment supersedes overlapping drafts; late drafts cannot undo a final.
@@ -121,7 +136,7 @@ export class Sound2Text {
       this.utterances.push(normalized);
     }
     this.utterances.sort((a, b) => a.start_time - b.start_time); this.utterances = this.utterances.slice(-200);
-    this.text = (typeof result.text === 'string' ? result.text : this.utterances.map(u => u.text).join('')).slice(-32000);
+    this.text = this.utterances.map(u => speakerLine(u.speaker, u.text)).filter(Boolean).join('\n').slice(-32000);
     this.events.emit('text', { text: this.text, utterances: structuredClone(this.utterances), audioMs: this.audioMs }); this.tryFinalize(); this.changed();
   }
   armCapture(boundaryMs) {
@@ -155,14 +170,14 @@ export class Sound2Text {
     if (!allowGap && Math.max(...relevant.map(u => u.end_time)) + 100 < capture.endMs) return { wait: true };
     const parts = [];
     for (const u of relevant) {
-      if (u.start_time >= capture.boundaryMs && u.end_time <= capture.cutoffMs) { parts.push(u.text); continue; }
+      if (u.start_time >= capture.boundaryMs && u.end_time <= capture.cutoffMs) { parts.push(speakerLine(u.speaker, u.text)); continue; }
       const words = u.words.filter(w => Number.isFinite(w.start_time) && Number.isFinite(w.end_time));
       if (!words.length) return { cancel: '识别分句跨越按钮边界且缺少词时间戳，请重新说完整指令' };
       if (words.some(w => w.start_time >= capture.boundaryMs && w.start_time < capture.cutoffMs && w.end_time > capture.cutoffMs)) return { cancel: '结束时仍在说话，指令截断在词中，请重新说完整指令' };
       const selected = words.filter(w => w.start_time >= capture.boundaryMs && w.start_time <= capture.endMs && w.end_time <= capture.cutoffMs);
-      parts.push(selected.map(w => w.text ?? w.word ?? '').join(''));
+      parts.push(speakerLine(u.speaker, selected.map(w => w.text ?? w.word ?? '').join('')));
     }
-    const text = parts.join('').trim();
+    const text = parts.filter(Boolean).join('\n').trim();
     return text ? { text } : { wait: true };
   }
   settle(result) {

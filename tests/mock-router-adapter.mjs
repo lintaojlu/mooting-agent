@@ -1,6 +1,6 @@
 import { LlmAdapter, ToolCallId } from '@deepseek-ai/dsh-llm';
 import { randomUUID } from 'node:crypto';
-import { commandFromPrompt } from '../src/context.mjs';
+import { commandFromPrompt } from '../src/context/index.mjs';
 
 export function textChunks(text) {
   return [
@@ -20,31 +20,48 @@ export function toolChunks(name, args, id = randomUUID()) {
   ];
 }
 const contentText = message => (message.content ?? []).filter(b => b.type === 'text').map(b => b.text).join('');
+const memoryText = text => text.startsWith('Current runtime context') || text.startsWith('## 长期记忆');
+export function scriptedInstruction(messages) {
+  const raw = [...messages].reverse().find(message => message.role === 'user' && !memoryText(contentText(message)));
+  const text = contentText(raw ?? {});
+  try { const input = JSON.parse(text); if (typeof input.instruction === 'string') return input.instruction; } catch {}
+  if (text.includes('## 待提取指令')) {
+    const speech = text.split('## 待提取指令')[0].replace(/^## 最近1分钟原话[^\n]*\n/u, '').trim();
+    return speech.split(/(?<=[。！？!?])\s*|\n+/u).filter(Boolean).at(-1)?.trim() ?? '';
+  }
+  return commandFromPrompt(text);
+}
+export function scriptedTool(instruction) {
+  if (/关闭/.test(instruction) && /说话人|面前/.test(instruction)) return 'close_speaker';
+  if (/说话人|面前/.test(instruction)) return 'open_speaker';
+  return undefined;
+}
+function continuation(result, instruction) {
+  if (result.close_first) return toolChunks(result.close_first, {});
+  if (result.closed && !/关闭/.test(instruction)) {
+    const next = scriptedTool(instruction);
+    if (next?.startsWith('open_')) return toolChunks(next, {});
+  }
+  return textChunks(result.say ?? result.error ?? '当前没有功能变化。');
+}
 
 /** Scripted model protocol adapter; actual DSH request/tool/continuation loop remains in use. */
 export class MockRouterAdapter extends LlmAdapter {
+  constructor({ hold, onHold } = {}) { super(); this.hold = hold; this.onHold = onHold; }
   async resolveModel(provider, model) { return { provider, id: model, name: 'Mock Router（规则模拟）', contextWindow: 64000, defaultMaxTokens: 1024 }; }
   async *stream(options) {
+    this.onHold?.();
+    if (this.hold) await this.hold;
     options.signal?.throwIfAborted();
     const last = options.messages.at(-1);
+    const instruction = scriptedInstruction(options.messages);
     let chunks;
     if (last?.role === 'tool') {
-      const text = contentText(last);
-      let result;
-      try { result = JSON.parse(text); } catch { result = { text }; }
-      const answer = result.result?.text ?? (result.status === 'running' ? '模拟实时字幕已启动。再次交互或关闭后会自行退出。' : result.error ? `任务未完成：${result.error}` : '任务已执行，结果已记录。');
-      chunks = textChunks(answer);
+      let result; try { result = JSON.parse(contentText(last)); } catch { result = {}; }
+      chunks = continuation(result, instruction);
     } else {
-      const raw = [...options.messages].reverse().find(m => m.role === 'user');
-      let input;
-      try { input = JSON.parse(contentText(raw ?? {})); } catch { input = { instruction: commandFromPrompt(contentText(raw ?? {})) }; }
-      if (input.kind === 'task_event') chunks = textChunks(input.task_events?.map(event => event.result?.text ?? event.result?.error ?? (event.status === 'running' ? '实时字幕已开启。' : '实时字幕任务已完成。')).join('\n') || '任务状态已更新。');
-      else {
-        const text = input.instruction ?? '';
-        const capability = /字幕|subtitle/i.test(text) ? 'realtime_subtitle' : /解释|什么是|术语|explain/i.test(text) ? 'explain_term' : /总结|摘要|整理|summary/i.test(text) ? 'summarize_context' : undefined;
-        chunks = capability ? toolChunks('dispatch_worker', { capability, execution_kind: capability === 'realtime_subtitle' ? 'program' : 'model', input_id: input.id })
-          : textChunks('模拟 Router 支持开启字幕、解释术语、总结 Context。真实模型模式可处理更开放的指令。');
-      }
+      const name = scriptedTool(instruction);
+      chunks = name ? toolChunks(name, {}) : textChunks(`模拟 Router 已处理：${instruction}`);
     }
     for (const chunk of chunks) { options.signal?.throwIfAborted(); yield chunk; }
   }

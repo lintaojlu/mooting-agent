@@ -1,0 +1,868 @@
+"""
+Tool implementations for the reflect agent.
+
+Implements hierarchical retrieval:
+1. search_mental_models - User-curated stored reflect responses (highest quality)
+2. search_observations - Consolidated knowledge with freshness
+3. recall - Raw facts as ground truth
+"""
+
+import json
+import logging
+import uuid
+from dataclasses import replace
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, cast
+
+from ..decision_rerank_interface import EvidenceImage
+from ..prompt_utils import truncate_context_for_prompt
+from ..response_models import KnowledgeDocumentHit, MemoryFact
+from ..schema import fq_table
+from ..search.tags import TagGroup, TagsMatch, tag_filter_active, tags_satisfy_groups
+from ..source_scope import ids_passing, visible_document_ids
+from .tokenization import count_prompt_tokens
+
+if TYPE_CHECKING:
+    # The engine's own connection abstraction, which is what every caller passes. This said
+    # `asyncpg.Connection` -- the concrete driver type -- which predates that abstraction and
+    # was never what arrived here; only `.fetch()` is used, and both provide it.
+    from ...models import RequestContext
+    from ..db.base import DatabaseConnection
+    from ..memory_engine import MemoryEngine
+
+logger = logging.getLogger(__name__)
+
+#: Default token budget for the pages ``search_mental_models`` returns whole. Pages are
+#: packed in rank order until it is spent; a page that does not fit comes back as a
+#: snippet. One page whole under a fixed 4,000-token limit (#4716) left a bank whose
+#: pages are all larger with no page at all, and the answer is not always in the top
+#: hit (#5787). A bank or a request can change it through
+#: ``reflect_default_options.reflect_search_mental_models_max_tokens``.
+DEFAULT_MENTAL_MODELS_SEARCH_MAX_TOKENS = 16000
+
+#: The budget a mental-model refresh searches pages with: the best page whole, the rest
+#: snippets. At the reflect default, test_refresh_pages_benchmark_cost's refreshes (sibling pages
+#: included) cost ~50% more input (79k -> 120k full, 69k -> 100k delta), mostly sibling
+#: pages a refresh does not need.
+REFRESH_MENTAL_MODELS_SEARCH_MAX_TOKENS = 1
+
+
+#: Retrieval plumbing that the reflect agent never reads, dropped from tool
+#: results before they reach the model.
+#:
+#: These are scores and internal pointers, not evidence the agent can reason with
+#: (provenance it CAN reason with is kept -- see ``metadata`` below): the agent cites by
+#: ``id``, ``based_on`` re-reads the cited memories' provenance from the store
+#: (``MemoryEngine._evidence_as_stored``), and the expand tool takes
+#: ``memory_ids`` and resolves chunks server-side -- so nothing downstream needs
+#: them here, while on real banks they measure several times the size of the
+#: observation text they accompany.
+#:
+#: Identity, text, dates, tags and ``source_fact_ids`` are deliberately kept.
+#: So is ``entities``: it carries canonical entity *names* (not ids), which are
+#: semantically useful retrieval handles -- the canonical name can differ from
+#: the surface text ("Bob" in the text vs canonical "Robert Smith"). Reflect's
+#: recalls don't populate it today (``include_entities`` defaults to False), but
+#: trimming it would bake in dropping the names if that ever flips on.
+#:
+#: ``metadata`` used to be dropped here too, and that made a document's own
+#: metadata unusable for reasoning: a bank that stamps where each document came
+#: from (``{"source": "guide"}`` on the handbook, ``{"source": "conversation"}``
+#: on a transcript) had no way to tell reflect which to believe, because the
+#: model never saw the stamp. Once extraction has flattened both into plain
+#: assertions -- "a pull request needs two approvals" and "one approval is enough
+#: for small ones" -- provenance is the ONLY thing left that separates a policy
+#: from someone's opinion, and recency picks the wrong one because the chatter is
+#: newer. So it is sent now, and an operator can rank the sources in the bank's
+#: reflect mission with no new configuration at all.
+#:
+#: The cost is paid only by banks that write metadata: ``_prune_nulls`` drops an
+#: empty bag, so a bank that stamps nothing sends nothing, and a bank that stamps
+#: a lot pays for what it chose to stamp.
+_UNREAD_RESULT_FIELDS = ("scores", "chunk_id", "document_id")
+
+
+def _drop_unread_fields(d: dict[str, Any]) -> dict[str, Any]:
+    """Strip retrieval plumbing from one serialized tool result and cap its ``context``.
+
+    Mutates and returns ``d``, which is always a fresh ``model_dump()`` by the
+    time it gets here -- never a caller's dict.
+    """
+    for k in _UNREAD_RESULT_FIELDS:
+        d.pop(k, None)
+    if "context" in d:
+        d["context"] = truncate_context_for_prompt(d["context"])
+    return d
+
+
+def _prune_nulls(d: dict[str, Any]) -> dict[str, Any]:
+    """Drop keys whose value is None or an empty collection (``""``, ``[]``, ``{}``).
+
+    Reflect tools dump ``MemoryFact`` / ``ObservationResult`` via ``model_dump()``,
+    which emits every field including the many that are typically null or empty
+    (``context``, ``occurred_start``, ``metadata``, ``tags``, etc.). Stripping
+    these before serializing to JSON for the LLM cuts token cost and removes
+    fields that aren't telling the model anything.
+
+    Callers that need the *presence* of a specific field as a signal (e.g.
+    ``source_fact_ids`` for drill-down) must ensure the value is non-empty —
+    pass the upstream flag that populates it (e.g. ``source_facts_max_tokens``
+    > 0 on ``tool_search_observations``) rather than relying on Pydantic
+    emitting ``None``.
+    """
+    return {k: v for k, v in d.items() if v is not None and v != "" and v != [] and v != {}}
+
+
+def _document_metadata_from_retain_params(retain_params: Any) -> dict[str, Any] | None:
+    """Return document metadata stored under retain_params.metadata."""
+    if isinstance(retain_params, str):
+        try:
+            retain_params = json.loads(retain_params)
+        except json.JSONDecodeError:
+            return None
+
+    if not isinstance(retain_params, dict):
+        return None
+
+    metadata = retain_params.get("metadata")
+    return metadata if isinstance(metadata, dict) else None
+
+
+async def tool_search_mental_models(
+    memory_engine: "MemoryEngine",
+    conn: "DatabaseConnection",
+    bank_id: str,
+    query: str,
+    query_embedding: list[float],
+    max_results: int = 5,
+    full_pages_max_tokens: int = DEFAULT_MENTAL_MODELS_SEARCH_MAX_TOKENS,
+    tags: list[str] | None = None,
+    tags_match: TagsMatch = "any",
+    tag_groups: "list | None" = None,
+    exclude_ids: list[str] | None = None,
+    last_memory_write_at: datetime | None = None,
+) -> dict[str, Any]:
+    """
+    Search user-curated mental models by semantic similarity.
+
+    Mental models are high-quality, manually created summaries about specific topics.
+    They should be searched FIRST as they represent the most reliable synthesized knowledge.
+
+    Args:
+        conn: Database connection
+        bank_id: Bank identifier
+        query: Search query (for logging/tracing)
+        query_embedding: Pre-computed embedding for semantic search
+        max_results: Maximum number of mental models to return
+        full_pages_max_tokens: Budget for the pages returned whole, packed in rank order; a page
+            that does not fit is a snippet the model can read with read_mental_models. The
+            best-ranked page is always whole, as in read_mental_models
+        tags: Optional tags to filter mental models
+        tags_match: How to match tags - "any", "all", "any_strict", "all_strict", or "exact"
+        exclude_ids: Optional list of mental model IDs to exclude (e.g., when refreshing a mental model)
+        last_memory_write_at: The bank's newest memory write, resolved once per reflect. Skips the
+            per-model staleness query for any model refreshed at or after it.
+
+    Returns:
+        Dict with matching mental models including content and freshness info
+    """
+    from ..memory_engine import _mental_model_stale_scope_from_row, _page_snippet
+    from ..search.tags import build_tag_groups_where_clause, build_tags_where_clause
+
+    # Build filters dynamically
+    filters = ""
+    params: list[Any] = [bank_id, str(query_embedding), max_results]
+    next_param = 4
+
+    # Exact matching treats absent or empty tags as the global scope. Do not
+    # skip the filter, or mental models would see every scope while the other
+    # reflect retrieval tools correctly see only untagged data.
+    if tags or tags_match == "exact":
+        built = build_tags_where_clause(tags, param_offset=next_param, match=tags_match)
+        tag_clause = built.sql
+        tag_params = built.params
+        next_param = built.next_param_offset
+        filters += f" {tag_clause}"
+        params.extend(tag_params)
+
+    if tag_groups:
+        built = build_tag_groups_where_clause(tag_groups, next_param)
+        groups_clause = built.sql
+        groups_params = built.params
+        next_param = built.next_param_offset
+        filters += f" {groups_clause}"
+        params.extend(groups_params)
+
+    if exclude_ids:
+        filters += f" AND id != ALL(${next_param}::text[])"
+        params.append(exclude_ids)
+        next_param += 1
+
+    # Search mental models by embedding similarity.
+    #
+    # A store that indexes pages answers the ranking and the relevance; Postgres still hydrates the
+    # rows, because the store holds only the searchable half. The tag scope and `exclude_ids` are
+    # pushed down rather than applied afterwards: a hit that gets discarded here has already taken a
+    # top-k slot from a page that would have qualified.
+    from ..memories import get_memories
+
+    store = get_memories()
+    if store.store_owned_for(bank_id):
+        matches = await store.search_pages_semantic(
+            bank_id,
+            embedding=list(query_embedding),
+            limit=max_results,
+            tags=tags,
+            tags_match=tags_match,
+            tag_groups=tag_groups,
+            exclude_ids=exclude_ids,
+        )
+        relevance_by_id = {m.page_id: m.score for m in matches}
+        rows = (
+            await conn.fetch(
+                f"""
+                SELECT
+                    id, name, content,
+                    tags, created_at, last_refreshed_at, last_memory_seen_at, trigger
+                FROM {fq_table("mental_models")}
+                WHERE bank_id = $1 AND id = ANY($2::text[])
+                """,
+                bank_id,
+                list(relevance_by_id),
+            )
+            if relevance_by_id
+            else []
+        )
+        # The store ranked them; the SELECT did not preserve that, so restore it here rather than
+        # returning whatever order the planner produced.
+        rows = sorted(rows, key=lambda r: -relevance_by_id.get(str(r["id"]), 0.0))
+    else:
+        relevance_by_id = None
+        rows = await conn.fetch(
+            f"""
+            SELECT
+                id, name, content,
+                tags, created_at, last_refreshed_at, last_memory_seen_at, trigger,
+                1 - (embedding <=> $2::vector) as relevance
+            FROM {fq_table("mental_models")}
+            WHERE bank_id = $1 AND embedding IS NOT NULL {filters}
+            ORDER BY embedding <=> $2::vector
+            LIMIT $3
+            """,
+            *params,
+        )
+
+    # Per-MM staleness: new in-scope memories since last refresh (includes pending).
+    # Every model gets the exact, scoped answer — the agent trusts a model without a
+    # verifying recall() only on `is_stale is False`, so guessing conservatively here
+    # would buy LLM turns to save a query. One round-trip for the whole result set:
+    # the models the bank-wide watermark already proves current are answered without
+    # a query at all, the rest are asked together.
+    staleness = await memory_engine.compute_mental_models_are_stale(
+        conn,
+        bank_id,
+        {str(row["id"]): _mental_model_stale_scope_from_row(row, key=str(row["id"])) for row in rows},
+        watermark=last_memory_write_at,
+    )
+
+    mental_models = []
+    full_pages_spent = 0
+
+    for row in rows:
+        last_refreshed_at = row["last_refreshed_at"]
+        if last_refreshed_at and last_refreshed_at.tzinfo is None:
+            last_refreshed_at = last_refreshed_at.replace(tzinfo=timezone.utc)
+
+        is_stale = staleness[str(row["id"])]
+        staleness_reason = "new in-scope memories ingested since last refresh" if is_stale else None
+
+        content = row["content"] or ""
+        # Whole pages in rank order, up to the budget, the rest as snippets. A model that
+        # answers from a snippet without reading the page is a measured failure (test_reflect_from_page),
+        # so the best hit is always whole, even alone over the budget: a snippet of it
+        # would leave the search with no page at all (#5787). A lower page that does not
+        # fit is skipped, not the end of packing, so a smaller one after it still can.
+        cost = count_prompt_tokens(content)
+        whole = not mental_models or full_pages_spent + cost <= full_pages_max_tokens
+        if whole:
+            full_pages_spent += cost
+        mental_models.append(
+            {
+                "id": str(row["id"]),
+                "name": row["name"],
+                # Past the budget, a snippet like the page search this mirrors:
+                # five unbounded whole pages measured 8.7-19k tokens and were re-sent on
+                # every later turn of the loop, the largest single item in a reflect's
+                # floor (#4533). The model reads the ones it wants with
+                # ``read_mental_models``.
+                **(
+                    {"content": content}
+                    if whole
+                    # ``_page_snippet`` so a page with no body reads as
+                    # empty-on-purpose rather than as a blank match — the same
+                    # wording the page search gives for the same state.
+                    else {
+                        "snippet": _page_snippet(content),
+                        "content_chars": len(content),
+                    }
+                ),
+                "tags": row["tags"] or [],
+                # The store path carries relevance beside the rows (its SELECT hydrates only what
+                # the store does not hold); the SQL path has it as a computed column.
+                "relevance": round(
+                    relevance_by_id[str(row["id"])] if relevance_by_id is not None else row["relevance"],
+                    4,
+                ),
+                "updated_at": last_refreshed_at.isoformat() if last_refreshed_at else None,
+                "is_stale": is_stale,
+                "staleness_reason": staleness_reason,
+            }
+        )
+
+    return {
+        "query": query,
+        "count": len(mental_models),
+        "mental_models": mental_models,
+    }
+
+
+async def tool_read_mental_models(
+    conn: "DatabaseConnection",
+    bank_id: str,
+    mental_model_ids: list[str],
+    max_tokens: int = 6000,
+    tag_scope: list[TagGroup] | None = None,
+) -> dict[str, Any]:
+    """Read the full text of mental models the search returned as snippets.
+
+    The budget is spent in the order asked for and stops at the first page that
+    would cross it, so one enormous page cannot swallow the reflect's context —
+    the failure ``search_mental_models`` used to have by returning five of them
+    whole (#4533). A page that does not fit at all is reported by name rather
+    than silently missing.
+
+    ``tag_scope`` is the caller's forced tag scope: a page outside it reads as missing,
+    even when the model asks for it by id.
+    """
+    if not mental_model_ids:
+        return {"error": "read_mental_models requires mental_model_ids"}
+
+    rows = await conn.fetch(
+        f"""
+        SELECT id, name, content, tags, last_refreshed_at
+        FROM {fq_table("mental_models")}
+        WHERE bank_id = $1 AND id = ANY($2::text[])
+        """,
+        bank_id,
+        [str(i) for i in mental_model_ids],
+    )
+    by_id = {str(r["id"]): r for r in rows}
+
+    pages: list[dict[str, Any]] = []
+    omitted: list[str] = []
+    spent = 0
+    for wanted in mental_model_ids:
+        row = by_id.get(str(wanted))
+        if row is None or (tag_scope and not tags_satisfy_groups(row["tags"], tag_scope)):
+            omitted.append(str(wanted))
+            continue
+        content = row["content"] or ""
+        cost = count_prompt_tokens(content)
+        if pages and spent + cost > max_tokens:
+            # The id, not the name: ``not_read`` is a retry list, and the model can
+            # only ask again with an id.
+            omitted.append(str(row["id"]))
+            continue
+        spent += cost
+        last_refreshed_at = row["last_refreshed_at"]
+        pages.append(
+            {
+                "id": str(row["id"]),
+                "name": row["name"],
+                "content": content,
+                "tags": row["tags"] or [],
+                "updated_at": last_refreshed_at.isoformat() if last_refreshed_at else None,
+            }
+        )
+    out: dict[str, Any] = {"mental_models": pages}
+    if omitted:
+        out["not_read"] = omitted
+    return out
+
+
+async def tool_search_observations(
+    memory_engine: "MemoryEngine",
+    bank_id: str,
+    query: str,
+    request_context: "RequestContext",
+    max_tokens: int = 5000,
+    tags: list[str] | None = None,
+    tags_match: TagsMatch = "any",
+    tag_groups: "list | None" = None,
+    pending_consolidation: int = 0,
+    source_facts_max_tokens: int = -1,
+    include_entities: bool = True,
+    created_after: datetime | None = None,
+    created_before: datetime | None = None,
+) -> dict[str, Any]:
+    """
+    Search consolidated observations using recall.
+
+    Observations are auto-generated from memories. Returns freshness info
+    so the agent knows if it should also verify with recall().
+
+    Args:
+        memory_engine: Memory engine instance
+        bank_id: Bank identifier
+        query: Search query
+        request_context: Request context for authentication
+        max_tokens: Maximum tokens for results (default 5000)
+        tags: Optional tags to filter observations
+        tags_match: How to match tags - "any", "all", "any_strict", "all_strict", or "exact"
+        pending_consolidation: Number of memories waiting to be consolidated
+        source_facts_max_tokens: Token budget for source facts (-1 = disabled, 0+ = enabled with limit)
+        include_entities: Attach resolved entity names to each observation (see below)
+
+    Returns:
+        Dict with matching observations including freshness info and source memories
+    """
+    include_source_facts = source_facts_max_tokens != -1
+    recall_kwargs: dict[str, Any] = {}
+    if include_source_facts and source_facts_max_tokens > 0:
+        recall_kwargs["max_source_facts_tokens"] = source_facts_max_tokens
+
+    # Use an internal request context so this recall is not billed as a
+    # user-facing operation. The reflect caller is already billed for the
+    # overall reflect operation; double-billing the sub-recalls would
+    # overcharge the customer.
+    internal_ctx = replace(request_context, internal=True)
+    result = await memory_engine.recall_async(
+        bank_id=bank_id,
+        query=query,
+        fact_type=["observation"],
+        max_tokens=max_tokens,
+        enable_trace=False,
+        request_context=internal_ctx,
+        tags=tags,
+        tags_match=tags_match,
+        tag_groups=tag_groups,
+        include_source_facts=include_source_facts,
+        # Canonical entity names are semantic signal the surface text may lack
+        # ("Bob" in the text vs canonical "Robert Smith"): they populate each
+        # result's `entities` field, giving the agent resolved names to cite
+        # and to pivot follow-up queries on. They are also a large share of the
+        # serialized payload, so a bank that does not need them can turn them off
+        # (reflect_default_options.reflect_search_observations_include_entities, #4483).
+        include_entities=include_entities,
+        created_after=created_after,
+        created_before=created_before,
+        _connection_budget=1,
+        _quiet=True,
+        **recall_kwargs,
+    )
+
+    is_stale = pending_consolidation > 0
+    if pending_consolidation == 0:
+        freshness = "up_to_date"
+    elif pending_consolidation < 10:
+        freshness = "slightly_stale"
+    else:
+        freshness = "stale"
+
+    return {
+        "query": query,
+        "count": len(result.results),
+        "observations": [_drop_unread_fields(_prune_nulls(m.model_dump())) for m in result.results],
+        "source_facts": {
+            k: _drop_unread_fields(_prune_nulls(v.model_dump())) for k, v in (result.source_facts or {}).items()
+        },
+        "is_stale": is_stale,
+        "freshness": freshness,
+    }
+
+
+async def tool_recall(
+    memory_engine: "MemoryEngine",
+    bank_id: str,
+    query: str,
+    request_context: "RequestContext",
+    max_tokens: int = 2048,
+    tags: list[str] | None = None,
+    tags_match: TagsMatch = "any",
+    tag_groups: "list | None" = None,
+    connection_budget: int = 1,
+    max_chunk_tokens: int = 1000,
+    fact_types: list[str] | None = None,
+    include_chunks: bool = True,
+    created_after: datetime | None = None,
+    created_before: datetime | None = None,
+    include_documents: bool = False,
+    kb_images: int = 0,
+) -> dict[str, Any]:
+    """
+    Search memories using TEMPR retrieval.
+
+    This is the ground truth - raw facts and experiences.
+    Use when mental models/observations don't exist, are stale, or need verification.
+
+    Args:
+        memory_engine: Memory engine instance
+        bank_id: Bank identifier
+        query: Search query
+        request_context: Request context for authentication
+        max_tokens: Maximum tokens for results (default 2048)
+        tags: Filter by tags (includes untagged memories)
+        tags_match: How to match tags - "any", "all", "any_strict", "all_strict", or "exact"
+        connection_budget: Max DB connections for this recall (default 1 for internal ops)
+        max_chunk_tokens: Maximum tokens for raw source chunk text (default 1000)
+        fact_types: Optional filter for fact types to retrieve. Defaults to ["experience", "world"].
+        include_chunks: Whether to fetch raw chunk text alongside facts (default True).
+        kb_images: The most knowledge-bank pictures (an image, a PDF page) to hand the model, under
+            ``KB_IMAGES_KEY``; 0 hands none (the model cannot read images, or the bank said no).
+
+    Returns:
+        Dict with list of matching memories including raw chunk text (when include_chunks)
+    """
+    # Only world/experience are valid for raw recall (observation is handled by search_observations)
+    recall_fact_type = [ft for ft in (fact_types or ["experience", "world"]) if ft in ("world", "experience")]
+    internal_ctx = replace(request_context, internal=True)
+    result = await memory_engine.recall_async(
+        bank_id=bank_id,
+        query=query,
+        fact_type=recall_fact_type,
+        max_tokens=max_tokens,
+        enable_trace=False,
+        request_context=internal_ctx,
+        tags=tags,
+        tags_match=tags_match,
+        tag_groups=tag_groups,
+        created_after=created_after,
+        created_before=created_before,
+        # See tool_search_observations: resolved entity names on each result
+        # are worth the one extra lookup query.
+        include_entities=True,
+        _connection_budget=connection_budget,
+        _quiet=True,  # Suppress logging for internal operations
+        include_chunks=include_chunks,
+        max_chunk_tokens=max_chunk_tokens,
+        include_documents=include_documents,
+    )
+
+    # A chunk is raw source text: "I signed up yesterday" means nothing without the date it was
+    # said on. Its facts carry that date, so the chunk borrows it from the first one.
+    chunk_dates = {m.chunk_id: m.mentioned_at for m in reversed(result.results) if m.chunk_id and m.mentioned_at}
+    pictures = await _knowledge_pictures(memory_engine, result.documents, kb_images, request_context)
+    documents = _knowledge_documents(result.documents, pictures)
+    return {
+        **({KB_IMAGES_KEY: list(pictures.values())} if pictures else {}),
+        **documents,
+        "query": query,
+        "memories": [_drop_unread_fields(_prune_nulls(m.model_dump())) for m in result.results],
+        # ``chunks`` is deliberately not trimmed: ChunkInfo carries only
+        # chunk_text / chunk_index / truncated, so it holds none of the fields
+        # above and the call would be a no-op. Pinned by
+        # test_chunk_info_carries_no_unread_fields.
+        "chunks": {
+            k: _prune_nulls({**v.model_dump(), "mentioned_at": chunk_dates.get(k)})
+            for k, v in (result.chunks or {}).items()
+        },
+    }
+
+
+_DOCUMENTS_NOTE = (
+    "These documents come from the knowledge banks linked to this memory bank: authoritative product "
+    "documentation. When a document and a memory disagree, the document is right; answer from the document "
+    "and say the memory is outdated."
+)
+
+
+#: Where ``tool_recall`` puts the knowledge-bank pictures (``EvidenceImage``s): the agent pops them before
+#: anything else reads the output, and shows them to the model (and a decision model that reads images).
+KB_IMAGES_KEY = "_kb_images"
+#: A picture bigger than this is not sent: the strictest provider (Anthropic) refuses one over 5 MB.
+_MAX_PICTURE_BYTES = 5 * 1024 * 1024
+
+
+def _picture_label(hit: KnowledgeDocumentHit) -> str:
+    source = hit.filename or hit.document_id
+    return f"Picture of {source}, page {hit.page}" if hit.page is not None else f"Picture of {source}"
+
+
+async def _knowledge_pictures(
+    engine: "MemoryEngine",
+    hits: list[KnowledgeDocumentHit] | None,
+    limit: int,
+    request_context: "RequestContext",
+) -> dict[int, EvidenceImage]:
+    """The pictures behind the first ``limit`` image and PDF-page hits, by the hit's place in ``hits``.
+
+    Read on the caller's behalf, as the search was. A picture that cannot be read, or is too big,
+    is left out: its hit still reaches the agent as text.
+    """
+    if limit <= 0 or not hits:
+        return {}
+    from ...knowledge.service import get_knowledge_service
+
+    service = get_knowledge_service(engine)
+    caller = replace(request_context, internal=False)
+    pictures: dict[int, EvidenceImage] = {}
+    for position, hit in enumerate(hits):
+        if len(pictures) >= limit:
+            break
+        if hit.passage_url is None or hit.media_type not in ("image", "document"):
+            continue
+        try:
+            opened = await service.open_passage_media(hit.bank_id, hit.document_id, hit.passage_index, caller)
+            if not opened.content_type.startswith("image/"):
+                continue
+            data = b"".join([chunk async for chunk in opened.stream])
+        except Exception as exc:
+            logger.warning(f"Knowledge picture {hit.bank_id}/{hit.document_id}#{hit.passage_index} not read: {exc!r}")
+            continue
+        if len(data) > _MAX_PICTURE_BYTES:
+            continue
+        pictures[position] = EvidenceImage(label=_picture_label(hit), media_type=opened.content_type, data=data)
+    return pictures
+
+
+def _knowledge_documents(hits: list[KnowledgeDocumentHit] | None, pictures: dict[int, EvidenceImage]) -> dict[str, Any]:
+    """The linked knowledge banks' passages, for the agent: what it can read of them, plus who wins."""
+    if not hits:
+        return {}
+    docs = [
+        _prune_nulls(
+            {
+                "source": h.filename or h.document_id,
+                "document_id": h.document_id,
+                "page": h.page,
+                "start_ms": h.start_ms,
+                "end_ms": h.end_ms,
+                "media_type": h.media_type,
+                # A page image or a clip has no text the agent can read; it still learns the doc matched.
+                "text": h.text or f"[{h.media_type} passage: no text]",
+                # Its picture follows the results, under this label.
+                "picture": pictures[position].label if position in pictures else None,
+            }
+        )
+        for position, h in enumerate(hits)
+    ]
+    return {"documents_note": _DOCUMENTS_NOTE, "documents": docs}
+
+
+def _iso(value: datetime | None) -> str | None:
+    """A stored date as recall's results carry it."""
+    return value.isoformat() if value else None
+
+
+def returned_memories(tool: str, output: dict[str, Any]) -> list[MemoryFact]:
+    """The memories a `recall` or `expand` call actually handed back.
+
+    Both are evidence the agent read, so both are citable and both reach `based_on`
+    (#5474: only recall's were, so a fact read through `expand` lost its citation).
+    Ids `expand` reported as malformed, missing or outside the tag scope carry no
+    `memory` and stay uncitable.
+    """
+    if tool == "recall":
+        raw = output.get("memories") or []
+    elif tool == "expand":
+        # expand names the fact type `type`; recall, like MemoryFact, `fact_type`.
+        raw = [{**r["memory"], "fact_type": r["memory"]["type"]} for r in output.get("results") or [] if "memory" in r]
+    else:
+        return []
+    return [
+        MemoryFact(
+            id=m["id"],
+            text=m.get("text", ""),
+            fact_type=m.get("fact_type", "world"),
+            context=m.get("context"),
+            occurred_start=m.get("occurred_start"),
+            occurred_end=m.get("occurred_end"),
+        )
+        for m in raw
+        if m.get("id")
+    ]
+
+
+async def tool_expand(
+    conn: "DatabaseConnection",
+    bank_id: str,
+    memory_ids: list[str],
+    depth: str,
+    *,
+    tags: list[str] | None,
+    tags_match: TagsMatch,
+    tag_groups: list[TagGroup] | None,
+) -> dict[str, Any]:
+    """
+    Expand multiple memories to get chunk or document context.
+
+    The reader's tag filter applies twice (#5030): a memory outside it reads as not
+    found, and a visible memory's chunk or document is returned only when that
+    DOCUMENT passes the filter too — a fact shared through a tag such as ``kind:rule``
+    does not open the rest of a document the reader cannot see. The filter arguments
+    are required so no caller can forget them and expand the whole bank.
+
+    Args:
+        conn: Database connection
+        bank_id: Bank identifier
+        memory_ids: List of memory unit IDs
+        depth: "chunk" or "document"
+        tags: The reader's tag filter (same as the recall it expands)
+        tags_match: How ``tags`` is matched
+        tag_groups: The reader's compound tag filter, already fuzzy-resolved
+
+    Returns:
+        Dict with results array, each containing memory, chunk, and optionally document data
+    """
+    if not memory_ids:
+        return {"error": "memory_ids is required and must not be empty"}
+
+    # Validate and convert UUIDs. Each id keeps a handle on its own UUID: a list of
+    # only the valid ones no longer lines up with memory_ids once one id is invalid.
+    uuid_by_id: dict[str, uuid.UUID] = {}
+    errors: dict[str, str] = {}
+    for mid in memory_ids:
+        try:
+            uuid_by_id[mid] = uuid.UUID(mid)
+        except ValueError:
+            errors[mid] = f"Invalid memory_id format: {mid}"
+
+    if not uuid_by_id:
+        return {"error": "No valid memory IDs provided", "details": errors}
+
+    valid_uuids = list(uuid_by_id.values())
+
+    # Batch fetch all memory units. Postgres hands back its rows; a store that keeps memories
+    # outside SQL normalizes its records to the same UUID-keyed mapping shape, so the
+    # result-building below stays store-agnostic.
+    from ..memories import get_memories
+
+    _store = get_memories()
+    memories = await _store.expand_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=valid_uuids)
+    # A memory outside the reader's filter is dropped here, so below it reads as "not found"
+    # rather than revealing that it exists.
+    scoped = tag_filter_active(tags, tags_match, tag_groups)
+    if scoped:
+        _visible_ids = ids_passing(
+            {str(m["id"]): m["tags"] for m in memories}, tags=tags, tags_match=tags_match, tag_groups=tag_groups
+        )
+        memories = [m for m in memories if str(m["id"]) in _visible_ids]
+    # Source text follows its document's tags, not the fact's. Resolved before any chunk or
+    # document text is read, so a hidden source is never fetched at all.
+    visible_docs = await visible_document_ids(
+        conn,
+        fq_table,
+        bank_id,
+        (m["document_id"] for m in memories),
+        tags=tags,
+        tags_match=tags_match,
+        tag_groups=tag_groups,
+    )
+    # A chunk with no document on the memory cannot be checked, so under a filter it is
+    # withheld too: fail closed.
+    withheld_ids = {
+        m["id"]
+        for m in memories
+        if (m["document_id"] and m["document_id"] not in visible_docs)
+        or (scoped and m["chunk_id"] and not m["document_id"])
+    }
+    memories = [{**dict(m), "chunk_id": None, "document_id": None} if m["id"] in withheld_ids else m for m in memories]
+    memory_map = {row["id"]: row for row in memories}
+
+    # Collect chunk_ids and document_ids for batch fetching
+    chunk_ids = [m["chunk_id"] for m in memories if m["chunk_id"]]
+    doc_ids_from_chunks: set[str] = set()
+    doc_ids_direct: set[str] = set()
+
+    # Batch fetch all chunks, and the documents behind them — both through the store, which
+    # owns the `chunks` and `documents` rows as well as the memories.
+    chunk_map: dict[str, Any] = {}
+    if chunk_ids:
+        chunk_map = await _store.expand_chunks(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, memories=memories, chunk_ids=chunk_ids
+        )
+        if depth == "document":
+            doc_ids_from_chunks = {c["document_id"] for c in chunk_map.values() if c["document_id"]}
+
+    # Collect direct document IDs (memories without chunks)
+    if depth == "document":
+        for m in memories:
+            if not m["chunk_id"] and m["document_id"]:
+                doc_ids_direct.add(cast(str, m["document_id"]))
+
+    # Batch fetch all documents
+    doc_map: dict[str, Any] = {}
+    all_doc_ids = list(doc_ids_from_chunks | doc_ids_direct)
+    if all_doc_ids:
+        doc_map = await _store.expand_documents(conn=conn, fq_table=fq_table, bank_id=bank_id, document_ids=all_doc_ids)
+
+    # Build results
+    results: list[dict[str, Any]] = []
+    for mid in memory_ids:
+        if mid in errors:
+            results.append({"memory_id": mid, "error": errors[mid]})
+            continue
+
+        memory = memory_map.get(uuid_by_id[mid])
+        if not memory:
+            results.append({"memory_id": mid, "error": f"Memory not found: {mid}"})
+            continue
+
+        # Recall shows a memory's dates, so expand must too: without them "yesterday" in the
+        # memory, or in its chunk, cannot be placed in time.
+        mentioned_at = _iso(memory["mentioned_at"])
+        item: dict[str, Any] = {
+            "memory_id": mid,
+            "memory": _prune_nulls(
+                {
+                    "id": str(memory["id"]),
+                    "text": memory["text"],
+                    "type": memory["fact_type"],
+                    "context": truncate_context_for_prompt(memory["context"]),
+                    "occurred_start": _iso(memory["occurred_start"]),
+                    "occurred_end": _iso(memory["occurred_end"]),
+                    "mentioned_at": mentioned_at,
+                }
+            ),
+        }
+
+        if memory["id"] in withheld_ids:
+            # Said outright so the agent stops asking, rather than retrying a depth that will
+            # never answer.
+            item["source_withheld"] = "The source of this memory is outside the current tag scope."
+
+        # Add chunk if available
+        if memory["chunk_id"] and memory["chunk_id"] in chunk_map:
+            chunk = chunk_map[cast(str, memory["chunk_id"])]
+            item["chunk"] = _prune_nulls(
+                {
+                    "id": chunk["chunk_id"],
+                    "text": chunk["chunk_text"],
+                    "index": chunk["chunk_index"],
+                    "document_id": chunk["document_id"],
+                    # The chunk was said when its memory was mentioned (see tool_recall).
+                    "mentioned_at": mentioned_at,
+                }
+            )
+            # Add document if depth=document
+            if depth == "document" and chunk["document_id"] in doc_map:
+                doc = doc_map[chunk["document_id"]]
+                item["document"] = {
+                    "id": doc["id"],
+                    "full_text": doc["original_text"],
+                    "metadata": _document_metadata_from_retain_params(doc["retain_params"]),
+                    "retain_params": doc["retain_params"],
+                }
+        elif memory["document_id"] and depth == "document" and memory["document_id"] in doc_map:
+            # No chunk, but has document_id
+            doc = doc_map[cast(str, memory["document_id"])]
+            item["document"] = {
+                "id": doc["id"],
+                "full_text": doc["original_text"],
+                "metadata": _document_metadata_from_retain_params(doc["retain_params"]),
+                "retain_params": doc["retain_params"],
+            }
+
+        results.append(item)
+
+    return {"results": results, "count": len(results)}

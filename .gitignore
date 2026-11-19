@@ -3,3 +3,6 @@
 /data/
 *.log
 .DS_Store
+
+# Hindsight 运行数据：profile、内嵌 Postgres、模型缓存。vendor/hindsight 只提交上游源码。
+.hindsight/

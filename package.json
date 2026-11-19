@@ -5,16 +5,25 @@
   "type": "module",
   "description": "Single-session MootingAgent prototype on the DSH plugin runtime",
   "scripts": {
-    "vendor": "node scripts/vendor-dsh.mjs",
-    "start": "node scripts/start.mjs",
-    "build:web": "node scripts/build-dsh-views.mjs",
-    "test:unit": "node --test tests/modules.test.mjs tests/capabilities-live.test.mjs tests/audio*.test.mjs tests/web.test.mjs",
+    "vendor": "node src/vendor-dsh.mjs",
+    "start": "node src/start.mjs",
+    "build:web": "node web/build-dsh-views.mjs",
+    "test:unit": "node --test tests/modules.test.mjs tests/capabilities-live.test.mjs tests/audio*.test.mjs tests/web.test.mjs tests/context*.test.mjs tests/hindsight-bridge.test.mjs tests/user-homes.test.mjs",
+    "test:memory": "node --test tests/memory-live.test.mjs",
+    "test:memory:browser": "node tests/memory-panel-browser.mjs",
+    "test:memory:soak": "node tests/memory-soak.mjs",
+    "test:memory:recall": "node tests/memory-recall-check.mjs",
+    "test:memory:latency": "node tests/memory-router-latency.mjs",
     "test:integration": "node --test tests/integration.test.mjs tests/model-wire.test.mjs tests/real-model-flow.test.mjs tests/sound2text.test.mjs",
-    "test:browser": "node scripts/browser-test.mjs",
+    "test:browser": "node src/browser-test.mjs",
     "test": "node --test tests/*.test.mjs"
   },
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
   "engines": { "node": ">=24.9.0", "dsh": "0.2.2-rc.1" },
+  "dependencies": {
+    "@vectorize-io/hindsight-all": "1.2.1",
+    "@vectorize-io/hindsight-client": "1.2.1"
+  },
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.0.5-alpha.1",
     "@deepseek-ai/dsh-agent": "0.2.2-rc.1",

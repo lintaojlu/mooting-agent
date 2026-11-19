@@ -1,9 +1,9 @@
 /** Only include utterances recorded after this subtitle activation; revisions replace their line. */
 export function subtitleText(utterances, boundaryMs) {
-  return (utterances ?? []).filter(utterance => utterance.end_time > boundaryMs).map(utterance => {
-    if (utterance.start_time >= boundaryMs) return utterance.text;
-    return (utterance.words ?? []).filter(word => Number.isFinite(word.start_time) && word.start_time >= boundaryMs).map(word => word.text ?? word.word ?? '').join('');
-  }).filter(Boolean).flatMap(text => text.split(/(?<=[。！？!?])\s*|\n+/u).map(line => line.trim()).filter(Boolean)).slice(-100).join('\n');
+  return (utterances ?? []).filter(utterance => utterance.end_time > boundaryMs).flatMap(utterance => {
+    const raw = utterance.start_time >= boundaryMs ? utterance.text : (utterance.words ?? []).filter(word => Number.isFinite(word.start_time) && word.start_time >= boundaryMs).map(word => word.text ?? word.word ?? '').join('');
+    return String(raw ?? '').split(/(?<=[。！？!?])\s*|\n+/u).map(line => line.trim()).filter(Boolean).map(line => utterance.speaker ? `${utterance.speaker}：${line}` : line);
+  }).slice(-100).join('\n');
 }
 
 /** Subtitle capability subscribes to the shared sound2text recognition service. */

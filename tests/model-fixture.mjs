@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { commandFromPrompt } from '../src/context.mjs';
+import { commandFromPrompt } from '../src/context/index.mjs';
 
 const textOf = message => typeof message?.content === 'string' ? message.content : (message?.content ?? []).map(part => part.text ?? '').join('');
 /** Test-only Responses API fixture. Scripted responses never load in the production app. */
@@ -10,18 +10,22 @@ export async function startModelFixture() {
     if (req.url !== '/v1/responses') { res.writeHead(404); res.end('Responses API only'); return; }
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
     const value = JSON.parse(Buffer.concat(chunks).toString('utf8')); requests.push(value);
-    const last = value.input.at(-1), user = [...value.input].reverse().find(item => item.role === 'user');
-    let input; try { input = JSON.parse(textOf(user)); } catch { input = { instruction: commandFromPrompt(textOf(user)) }; }
+    const last = value.input.at(-1);
+    const memory = text => text.startsWith('Current runtime context') || text.startsWith('## 长期记忆');
+    const user = [...value.input].reverse().find(item => item.role === 'user' && !memory(textOf(item)));
+    let instruction = textOf(user);
+    try { const parsed = JSON.parse(instruction); if (typeof parsed.instruction === 'string') instruction = parsed.instruction; } catch { instruction = commandFromPrompt(instruction); }
+    const toolName = /关闭/.test(instruction) && /说话人|面前/.test(instruction) ? 'close_speaker' : /说话人|面前/.test(instruction) ? 'open_speaker' : undefined;
     const n = requests.length; let output;
     const message = text => ({ type: 'message', id: `msg-${n}`, role: 'assistant', status: 'completed', content: [{ type: 'output_text', text, annotations: [] }] });
-    if (!value.tools?.length) output = message(`测试模型接口已处理：${input.instruction}`);
+    const call = name => ({ type: 'function_call', id: `fc-item-${n}`, call_id: `fixture-${n}`, name, arguments: '{}', status: 'completed' });
+    if (!value.tools?.length) output = message(`测试模型接口已处理：${instruction}`);
     else if (last.type === 'function_call_output') {
-      const result = JSON.parse(last.output); output = message(result.result?.text ?? (result.status === 'running' ? '实时字幕已开启。' : result.status === 'starting' ? '正在处理。' : '任务未成功，请检查执行结果。'));
-    } else if (input.kind === 'task_event') output = message(input.task_events?.map(event => event.result?.text ?? event.result?.error ?? (event.status === 'running' ? '实时字幕已开启。' : '实时字幕任务已完成。')).join('\n') || '任务状态已更新。');
-    else {
-      const capability = /说话人|面前.*谁/.test(input.instruction) ? 'speaker_identification' : /字幕/.test(input.instruction) ? 'realtime_subtitle' : /解释|术语/.test(input.instruction) ? 'explain_term' : /总结/.test(input.instruction) ? 'summarize_context' : 'general_assistant';
-      output = { type: 'function_call', id: `fc-item-${n}`, call_id: `fixture-${n}`, name: 'dispatch_worker', arguments: JSON.stringify({ capability, execution_kind: ['realtime_subtitle', 'speaker_identification'].includes(capability) ? 'program' : 'model', input_id: input.id }), status: 'completed' };
-    }
+      const result = JSON.parse(last.output);
+      if (result.close_first) output = call(result.close_first);
+      else if (result.closed && !/关闭/.test(instruction) && toolName?.startsWith('open_')) output = call(toolName);
+      else output = message(result.say ?? result.error ?? '当前没有功能变化。');
+    } else output = toolName ? call(toolName) : message(`测试模型接口已处理：${instruction}`);
     const reasoning = { type: 'reasoning', id: `rs-${n}`, summary: [{ type: 'summary_text', text: '测试服务正在检查输入。' }], encrypted_content: `fixture-encrypted-${n}` };
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
     const send = event => res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);

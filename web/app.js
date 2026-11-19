@@ -12,7 +12,7 @@
   }
   function validateState(value) {
     if (!value || typeof value.sessionId !== 'string' || !['unconfigured', 'live', 'mock'].includes(value.mode) || typeof value.busy !== 'boolean' || !Array.isArray(value.events) || !Array.isArray(value.trace) || !Array.isArray(value.tasks) || !value.subtitle || typeof value.subtitle.active !== 'boolean' || typeof value.subtitle.text !== 'string') throw new Error('服务端状态不符合约定。');
-    if (!value.context || typeof value.context.memory !== 'string' || typeof value.context.configured !== 'boolean' || !['idle', 'updating', 'error', 'unconfigured'].includes(value.context.status)) throw new Error('Context 状态不符合约定。');
+    if (!value.context || typeof value.context.memory !== 'string' || typeof value.context.configured !== 'boolean' || !['idle', 'updating', 'error', 'unconfigured', 'disabled', 'starting', 'ready', 'offline'].includes(value.context.status)) throw new Error('Context 状态不符合约定。');
     if (value.context.fragments !== undefined && (!Array.isArray(value.context.fragments) || value.context.fragments.some(item => !item || typeof item.text !== 'string'))) throw new Error('Context 片段不符合约定。');
     if (value.speaker && (typeof value.speaker.active !== 'boolean' || (value.speaker.active && value.speaker.person !== null && (!value.speaker.person || ['name', 'identity'].some(key => typeof value.speaker.person[key] !== 'string') || !Array.isArray(value.speaker.person.notes) || value.speaker.person.notes.some(note => typeof note !== 'string'))))) throw new Error('说话人状态不符合约定。');
     validateConfig(value.modelConfig); return value;
@@ -32,9 +32,29 @@
     if (capture?.status === 'finishing') return { text: '正在等待语音识别完成…', error: false };
     return null;
   }
+  function limitChars(text, limit = 50) {
+    const value = String(text ?? '');
+    const chars = Array.from(value);
+    return chars.length > limit ? chars.slice(0, limit).join('') : value;
+  }
   function blockText(content) {
     if (!Array.isArray(content)) return '';
     return content.filter(block => block && block.type === 'text' && typeof block.text === 'string').map(block => block.text).join('').trim();
+  }
+  function limitAssistantEvents(events) {
+    return (events ?? []).map(event => {
+      if (event?.type !== 'assistant/message' && event?.type !== 'assistant/attempt') return event;
+      const message = event.data?.message;
+      if (!Array.isArray(message?.content)) return event;
+      let budget = 50;
+      const content = message.content.map(block => {
+        if (!block || block.type !== 'text' || typeof block.text !== 'string') return block;
+        const text = limitChars(block.text, budget);
+        budget -= Array.from(text).length;
+        return text === block.text ? block : { ...block, text };
+      });
+      return { ...event, data: { ...event.data, message: { ...message, content } } };
+    });
   }
   function instructionText(content) {
     const raw = blockText(content);
@@ -53,12 +73,15 @@
         const command = typeof data.source.command === 'string' ? data.source.command.trim() : '';
         const text = command || instructionText(data.content);
         if (text) turns.push({ role: 'user', text });
+      } else if (event.type === 'user/message' && data.source?.kind === 'mooting-memory-report') {
+        // A finished background recall wakes the Router; show it as a status line, not as something the user said.
+        turns.push({ role: 'status', text: '记忆回想完成' });
       } else if (event.type === 'assistant/message') {
-        const text = blockText(data.message?.content);
+        const text = limitChars(blockText(data.message?.content));
         if (text) turns.push({ role: 'assistant', text });
       }
     }
-    const partial = value.busy && typeof value.stream?.text === 'string' ? value.stream.text : '';
+    const partial = value.busy && typeof value.stream?.text === 'string' ? limitChars(value.stream.text) : '';
     if (partial) {
       const last = turns.at(-1);
       if (!(last?.role === 'assistant' && last.text === partial)) turns.push({ role: 'assistant', text: partial, streaming: true });
@@ -71,8 +94,22 @@
   }
   function functionPanel(value) {
     if (value.speaker?.active) return { kind: 'speaker', text: '' };
-    if (value.subtitle?.active) return { kind: 'subtitle', text: value.subtitle.text || '' };
     return { kind: null, text: '' };
+  }
+  function mainCaption(value) {
+    const text = value?.sound2text?.text;
+    return typeof text === 'string' ? text : '';
+  }
+  function lastSentence(text) {
+    const parts = String(text ?? '').split(/(?<=[。！？!?])\s*|\n+/u).map(part => part.trim()).filter(Boolean);
+    return parts.at(-1) ?? '';
+  }
+  function agentCard(value) {
+    const partial = value?.busy ? limitChars(value?.stream?.text ?? '') : '';
+    if (partial) return { text: partial, live: true };
+    if (value?.busy) return { text: '正在处理指令', live: true };
+    if (value?.lastError) return { text: '执行失败：' + value.lastError, live: false };
+    return { text: limitChars(latestRouterAnswer(value?.trace)), live: false };
   }
   function commandPanel(value) {
     const capture = value?.sound2text?.capture;
@@ -84,26 +121,48 @@
     if (Number.isFinite(boundary)) {
       for (const utterance of value.sound2text?.utterances ?? []) {
         if (!utterance || typeof utterance.text !== 'string' || !(utterance.end_time > boundary) || utterance.start_time > limit) continue;
-        if (utterance.start_time >= boundary) { parts.push(utterance.text); continue; }
-        const words = (utterance.words ?? []).filter(word => word && Number.isFinite(word.start_time) && word.start_time >= boundary && word.start_time <= limit);
-        if (words.length) parts.push(words.map(word => word.text ?? word.word ?? '').join(''));
+        if (utterance.start_time >= boundary) parts.push(utterance.speaker ? `${utterance.speaker}：${utterance.text}` : utterance.text);
+        else {
+          const words = (utterance.words ?? []).filter(word => word && Number.isFinite(word.start_time) && word.start_time >= boundary && word.start_time <= limit);
+          if (words.length) {
+            const text = words.map(word => word.text ?? word.word ?? '').join('');
+            parts.push(utterance.speaker ? `${utterance.speaker}：${text}` : text);
+          }
+        }
       }
     }
-    const text = parts.join('').trim();
+    const text = parts.join(value.sound2text.utterances?.some(item => item?.speaker) ? '\n' : '').trim();
     if (text) return { open: true, text };
     return { open: true, text: capture.status === 'finishing' ? '正在等待语音识别完成…' : '正在聆听，请说出指令…' };
   }
   function contextPanel(value) {
     const context = value?.context;
-    if (!context) return { text: '尚未形成记忆。', status: '等待信息流' };
+    if (!context) return { text: '还没有识别到原话。', status: '等待信息流' };
     const fragments = Array.isArray(context.fragments) ? context.fragments.filter(item => item && typeof item.text === 'string' && item.text.trim()) : [];
     const text = fragments.length ? fragments.map(item => {
       const when = Date.parse(item.at);
       const clock = Number.isFinite(when) ? new Date(when).toLocaleTimeString('zh-CN', { hour12: false }) : '';
       return (clock ? clock + '\n' : '') + item.text.trim();
-    }).join('\n\n') : context.status === 'updating' ? '正在整理这段对话…' : '尚未形成记忆。';
-    const status = context.status === 'updating' ? '整理中' : context.status === 'error' ? '更新失败' : context.status === 'unconfigured' ? '未配置' : context.configured ? '已同步' : '等待信息流';
-    return { text, status, error: context.error || '' };
+    }).join('\n\n') : context.status === 'updating' ? '正在写入记忆…' : '还没有识别到原话。';
+    const labels = { updating: '写入中', error: '更新失败', unconfigured: '记忆未配置', disabled: '记忆已关闭', starting: '记忆服务启动中', offline: '记忆服务离线' };
+    const status = labels[context.status] || (context.outbox > 0 ? context.lastFlush?.result === 'processing' ? '后台整理中' : '等待写入' : context.configured ? '已同步' : '等待信息流');
+    const injected = typeof context.memory === 'string' && context.memory.trim() ? context.memory.trim() : '当前没有可注入的记忆。';
+    return { text, status, error: context.error || '', info: memoryInfo(context), injected };
+  }
+  /** One line under the Context badge: outbox backlog, mental model refresh times, last flush. */
+  function memoryInfo(context) {
+    if (!context || context.outbox === undefined) return '';
+    const clock = at => { const when = Date.parse(at); return Number.isFinite(when) ? new Date(when).toLocaleTimeString('zh-CN', { hour12: false }) : '—'; };
+    const names = { 'user-profile': '档案', people: '人物', 'open-items': '事项' };
+    const models = Object.entries(context.models || {}).map(([id, at]) => (names[id] || id) + ' ' + (at ? clock(at) : '—')).join(' · ');
+    const flush = context.lastFlush ? '上次写入 ' + clock(context.lastFlush.at) + (context.lastFlush.result === 'ok' ? '' : context.lastFlush.result === 'failed' ? '（失败）' : context.lastFlush.result === 'processing' ? '（后台处理中）' : '（等待服务）') : '尚未写入';
+    return ['积压 ' + context.outbox + ' 条', models, flush].filter(Boolean).join('｜');
+  }
+  function contextTraceSummary(entry) {
+    const labels = { 'speech.final': '语音定稿', 'speech.paused': '语音暂停', 'turn.queued': '回合入队', 'router.busy': 'Router 执行中', 'router.idle': 'Router 空闲', 'flush.start': '开始写入', 'flush.deferred': '等待 Router 空闲', 'flush.offline': '记忆服务离线', 'flush.sealed': '封装批次', 'flush.end': '写入结束', 'flush.failed': '写入失败', 'flush.retry': '安排重试', 'retain.submitted': '提交 Hindsight', 'retain.check': '检查写入状态', 'retain.status': '写入状态', 'retain.completed': '写入完成', 'cache.refresh.start': '开始刷新缓存', 'cache.model': '模型缓存更新', 'cache.model.failed': '模型缓存失败', 'cache.refresh.end': '缓存刷新完成', 'hindsight.status': '记忆服务状态', 'memory.search.start': '开始检索', 'memory.search.end': '检索完成', 'memory.search.failed': '检索失败', 'memory.search.unavailable': '检索不可用', 'memory.reflect.start': '开始回想', 'memory.reflect.end': '回想完成', 'memory.reflect.failed': '回想失败', 'memory.reflect.unavailable': '回想不可用' };
+    const data = entry?.data ?? {};
+    return { at: entry?.at ?? '', type: entry?.type ?? '', label: labels[entry?.type] || entry?.type || '未知事件',
+      detail: [data.documentId, data.id, data.reason, data.status, data.text, data.query, data.error].filter(Boolean).join(' · ') };
   }
   const OPENINGS = ['已准备好做你的co-pilot！', '我在。想先做点什么？', '随时可以开始。', '今天想一起搞定什么？', '准备好了，把指令交给我。'];
   let openingIndex = 0;
@@ -138,12 +197,15 @@
     if (!audioState(value, localStatus).running) throw new Error('请先开启语音输入。');
     return { path: '/api/voice/interaction', body: {} };
   }
-  root.MootingUI = { captureFeedback, audioState, interactionRequest, submission, validateState, validateConfig, modelSubmission, latestRouterAnswer, routerDialogue, outputContent, functionPanel, commandPanel, contextPanel };
+  root.MootingUI = { captureFeedback, audioState, interactionRequest, submission, validateState, validateConfig, modelSubmission, latestRouterAnswer, routerDialogue, outputContent, functionPanel, mainCaption, lastSentence, agentCard, commandPanel, contextPanel, memoryInfo, contextTraceSummary };
   if (typeof document === 'undefined') return;
   openingIndex = Math.floor(Math.random() * OPENINGS.length);
   const $ = id => document.getElementById(id);
   function renderClock() {
     const now = new Date();
+    const date = $('output-date');
+    date.textContent = (now.getMonth() + 1) + '/' + now.getDate() + ' 周' + '日一二三四五六'[now.getDay()];
+    date.dateTime = now.toISOString();
     const clock = $('output-title');
     clock.textContent = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
     clock.dateTime = now.toISOString();
@@ -151,16 +213,20 @@
   renderClock();
   const clockTimer = setInterval(renderClock, 10000);
   let state, config, source, connected = false, dictating = false, closing = false, saving = false, generation = 0, configLoaded = false, formDirty = false;
-  let audio, localAudioStatus = 'idle', lastSoundError = '', lastCaptureError = '';
+  let agentOpen = false, agentPhase = 'idle';
+  let audio, localAudioStatus = 'idle', lastSoundError = '', lastCaptureError = '', lastVoiceprintNotice = '';
   const captureClass = root.MootingAudio?.AudioCapture;
   if (captureClass) audio = new captureClass({ onStatus: status => { localAudioStatus = status; controls(); }, onError: message => notice(message, true) });
   function notice(message, error = false) { $('notice').textContent = message; $('notice').hidden = !message; $('notice').classList.toggle('error', error); }
   function controls() {
     const configured = config?.configured === true || state?.mode === 'mock';
-    const subtitleActive = !!state?.subtitle.active, speakerActive = !!state?.speaker?.active, voice = audioState(state, localAudioStatus);
+    const speakerActive = !!state?.speaker?.active, voice = audioState(state, localAudioStatus);
     const dictateBusy = dictating && voice.capturing === 'finishing';
     $('submit-button').disabled = !connected || dictateBusy || !configured || !voice.running || voice.busyAudio || voice.capturing === 'finishing';
-    $('submit-button').setAttribute('aria-label', '口述指令');
+    $('submit-button').setAttribute('aria-label', '右键');
+    $('close-agent').disabled = !connected || !agentOpen;
+    $('open-agent').disabled = !connected;
+    $('open-function').disabled = !connected || closing;
     $('save-model').disabled = saving || !!state?.busy;
     $('audio-toggle').disabled = !connected || localAudioStatus === 'stopping' || !audio;
     $('audio-toggle').setAttribute('aria-pressed', String(voice.active));
@@ -168,7 +234,7 @@
     $('audio-toggle').title = voice.active ? '暂停语音输入' : '开启语音输入';
     $('audio-toggle').querySelector('.play-symbol').toggleAttribute('hidden', voice.active);
     $('audio-toggle').querySelector('.pause-symbol').toggleAttribute('hidden', !voice.active);
-    $('esc-button').disabled = !connected || closing || !(subtitleActive || speakerActive);
+    $('esc-button').disabled = !connected || closing || !speakerActive;
     $('esc-button').setAttribute('aria-label', '关闭功能面板');
     $('inform_stream').readOnly = true;
     const text = state?.sound2text?.text;
@@ -178,18 +244,14 @@
     }
   }
 
-  function toggleWorker() { const separate = !$('worker-uses-router').checked; $('worker-settings').hidden = !separate; for (const id of ['worker-base-url', 'worker-model']) $(id).required = separate; }
   function displayConfig(value, populate = false) {
     config = validateConfig(value);
     $('config-status').textContent = config.configured ? '已配置' : '未配置';
     if (populate && !formDirty) {
-      for (const prefix of ['router', 'worker']) {
-        $(prefix + '-base-url').value = config[prefix].baseURL;
-        $(prefix + '-model').value = config[prefix].model;
-        $(prefix + '-api-key').value = '';
-        $(prefix + '-api-key').placeholder = config[prefix].hasApiKey ? '已设置，留空保留' : '无密钥可留空';
-      }
-      $('worker-uses-router').checked = config.workerUsesRouter; toggleWorker();
+      $('router-base-url').value = config.router.baseURL;
+      $('router-model').value = config.router.model;
+      $('router-api-key').value = '';
+      $('router-api-key').placeholder = config.router.hasApiKey ? '已设置，留空保留' : '无密钥可留空';
     }
     configLoaded = true; controls();
   }
@@ -227,51 +289,68 @@
     element.__tailFollow = { disconnect() { mutations.disconnect(); resize?.disconnect(); if (frame) cancelAnimationFrame(frame); element.__tailFollow = null; } };
     schedule();
   }
-  let trajectoryPane = null;
-  function aiAvatar() {
-    const mark = document.createElement('span');
-    mark.className = 'output-avatar';
-    mark.setAttribute('aria-hidden', 'true');
-    mark.textContent = '(ovo)';
-    return mark;
+  let contextTraceEntries = new Map();
+  function traceRow(entry) {
+    const record = contextTraceSummary(entry);
+    const row = document.createElement('tr'); row.dataset.seq = String(entry.seq);
+    const time = document.createElement('time');
+    time.dateTime = record.at;
+    const date = Date.parse(record.at);
+    time.textContent = Number.isFinite(date) ? new Date(date).toLocaleString('zh-CN', { hour12: false }) : '—';
+    const when = document.createElement('td'); when.append(time);
+    const stage = document.createElement('td'); stage.textContent = record.label;
+    const detail = document.createElement('td');
+    const disclosure = document.createElement('details');
+    const summary = document.createElement('summary'); summary.textContent = record.detail || record.type;
+    const raw = document.createElement('pre'); raw.textContent = JSON.stringify(entry.data ?? {}, null, 2);
+    disclosure.append(summary, raw); detail.append(disclosure);
+    row.append(when, stage, detail);
+    return row;
   }
-  function renderOutput(output) {
+  function renderContextTrace(entries) {
+    const rows = $('context-trace-rows');
+    if (!Array.isArray(entries) || !entries.length) return;
+    const unseen = entries.filter(entry => Number.isInteger(entry?.seq) && !contextTraceEntries.has(entry.seq));
+    if (!unseen.length) return;
+    for (const entry of unseen) contextTraceEntries.set(entry.seq, entry);
+    const ordered = [...contextTraceEntries.values()].sort((left, right) => left.seq - right.seq);
+    const lastShown = Number(rows.lastElementChild?.dataset.seq ?? 0);
+    if (unseen.some(entry => entry.seq <= lastShown)) rows.replaceChildren(...ordered.map(traceRow));
+    else for (const entry of unseen.sort((left, right) => left.seq - right.seq)) {
+      const row = traceRow(entry); row.dataset.seq = String(entry.seq); rows.append(row);
+    }
+    $('context-trace-count').textContent = String(Math.max(state?.context?.traceCount ?? 0, contextTraceEntries.size));
+  }
+  let trajectoryPane = null;
+  function paintAgent(text, live) {
     const node = $('output-text');
-    const turns = output.turns;
-    if (!turns) {
-      if (node.dataset.mode !== 'plain' || node.textContent !== output.text) {
-        node.dataset.mode = 'plain';
-        delete node.dataset.signature;
-        node.replaceChildren();
-        node.textContent = output.text;
-      }
+    node.replaceChildren();
+    const body = document.createElement('p');
+    body.className = 'output-turn-body' + (live ? ' thinking' : '');
+    body.textContent = text;
+    node.append(body);
+    node.classList.remove('thinking');
+  }
+  function renderAgent() {
+    $('output-stage').classList.toggle('is-agent', agentOpen);
+    $('agent-panel').setAttribute('aria-hidden', String(!agentOpen));
+    if (!agentOpen || !state) return;
+    if (agentPhase === 'wait' || state.busy) {
+      if (state.busy) agentPhase = 'live';
+      const card = state.busy ? agentCard(state) : { text: '正在处理指令', live: true };
+      paintAgent(card.text, card.live);
       return;
     }
-    const signature = turns.map(turn => turn.role + '\0' + turn.text).join('\n');
-    if (node.dataset.mode === 'dialogue' && node.dataset.signature === signature) return;
-    node.dataset.mode = 'dialogue';
-    node.dataset.signature = signature;
-    node.replaceChildren();
-    for (const turn of turns) {
-      const spoken = turn.role === 'assistant' || turn.role === 'status';
-      const line = document.createElement(spoken ? 'div' : 'p');
-      line.className = 'output-turn output-turn-' + turn.role + (turn.streaming ? ' is-streaming' : '');
-      if (spoken) {
-        const body = document.createElement('p');
-        body.className = 'output-turn-body' + (turn.role === 'status' ? ' thinking' : '');
-        body.textContent = turn.text;
-        line.append(aiAvatar(), body);
-      } else line.textContent = turn.text;
-      node.append(line);
-    }
+    if (agentPhase === 'live') agentPhase = 'idle';
+    paintAgent(agentCard(state).text, false);
   }
   function followScrollports() {
     bindTailFollow($('interaction-window'));
+    bindTailFollow($('main-panel'));
     bindTailFollow($('function-window'));
-    bindTailFollow($('command-panel'));
     bindTailFollow($('context-snapshot'));
+    bindTailFollow($('context-trace-view'));
     bindTailFollow($('agent-conversation'));
-    bindTailFollow($('worker-conversation'));
     const pane = $('trajectory-view')?.querySelector('[data-trajectory-scroll]');
     if (pane === trajectoryPane) return;
     trajectoryPane?.__tailFollow?.disconnect();
@@ -280,51 +359,44 @@
   }
   function renderViews() {
     const views = root.MootingDSHViews;
-    if (!views || typeof views.renderConversation !== 'function' || typeof views.renderTrajectory !== 'function' || typeof views.renderWorkers !== 'function') {
+    if (!views || typeof views.renderConversation !== 'function' || typeof views.renderTrajectory !== 'function') {
       $('views-error').textContent = 'DSH 对话与轨迹组件未加载。可展开原始事件查看数据；请检查 /dsh-views.js 和 /dsh-views.css。';
       $('views-error').hidden = false; followScrollports(); return;
     }
     try {
-      views.renderConversation($('agent-conversation'), { events: state.events, stream: state.stream, busy: state.busy });
-      views.renderWorkers($('worker-conversation'), { events: state.events, tasks: state.tasks, busy: state.busy });
-      views.renderTrajectory($('trajectory-view'), { events: state.events, stream: state.stream, busy: state.busy });
+      const stream = state.stream ? { ...state.stream, text: limitChars(state.stream.text ?? '') } : state.stream;
+      views.renderConversation($('agent-conversation'), { events: limitAssistantEvents(state.events), stream, busy: state.busy });
+      views.renderTrajectory($('trajectory-view'), { events: state.events, stream, busy: state.busy });
       $('views-error').hidden = true;
     } catch (error) { $('views-error').textContent = 'DSH 组件渲染失败：' + error.message; $('views-error').hidden = false; }
     followScrollports();
   }
   function applyState(value) {
     state = validateState(value); displayConfig(state.modelConfig, !configLoaded);
-    $('agent-status').textContent = state.busy ? '执行中' : state.events.length ? '已结束本轮' : '等待输入';
-    $('worker-status').textContent = state.tasks.some(task => ['starting', 'running', 'stopping'].includes(task.status)) ? '运行中' : state.tasks.length ? '任务已结束' : '等待任务';
+    $('agent-status').textContent = state.busy ? '执行中' : state.reflecting > 0 ? '回想中' : state.events.length ? '已结束本轮' : '等待输入';
     const memory = contextPanel(state);
     $('context-snapshot').textContent = memory.text;
+    $('context-injected').textContent = memory.injected;
     $('context-status').textContent = memory.status;
     $('context-status').title = memory.error;
-    const answer = latestRouterAnswer(state.trace), speakerActive = !!state.speaker?.active, active = state.subtitle.active || speakerActive;
-    const fn = functionPanel(state), command = commandPanel(state);
-    $('output-stage').classList.toggle('is-split', !!fn.kind);
-    $('output-stage').classList.toggle('is-command', command.open);
+    $('context-memory-info').textContent = memory.info;
+    $('context-memory-info').hidden = !memory.info;
+    renderContextTrace(state.context.trace);
+    $('context-trace-count').textContent = String(Math.max(state.context.traceCount ?? 0, contextTraceEntries.size));
+    const speakerActive = !!state.speaker?.active;
+    const fn = functionPanel(state);
+    $('output-stage').classList.toggle('is-function', !!fn.kind);
     $('function-panel').setAttribute('aria-hidden', String(!fn.kind));
     $('function-panel').classList.toggle('is-speaker', speakerActive);
-    $('command-panel').setAttribute('aria-hidden', String(!command.open));
-    $('function-text').hidden = fn.kind !== 'subtitle';
-    $('function-text').textContent = fn.kind === 'subtitle' ? fn.text : '';
-    $('command-text').textContent = command.text;
-    $('interaction-window').classList.toggle('subtitle-active', active);
-    const output = outputContent(state);
-    const feedback = captureFeedback(state);
-    $('display-mode').textContent = !active && feedback && !feedback.error ? (state.sound2text.capture.status === 'listening' ? '聆听中' : '等待识别') : speakerActive ? '说话人识别中 · 模拟' : active ? '字幕运行中' : state.lastError ? '失败' : output.streaming ? '生成中' : state.busy ? 'Thinking' : answer ? '' : '等待输入';
-    renderOutput(output);
-    $('output-text').hidden = false;
+    $('main-text').textContent = mainCaption(state);
+    renderAgent();
     $('speaker-card').hidden = !speakerActive;
     const person = state.speaker?.person;
     $('speaker-card-title').textContent = person?.name ?? '正在识别…';
     $('speaker-identity').textContent = person?.identity ?? '—';
     if (speakerActive) $('function-window').scrollTop = 0;
     renderSpeakerNotes(person?.notes);
-    $('output-text').classList.toggle('thinking', !output.turns && output.text === 'Thinking' && state.busy && !active && !state.lastError);
-    $('display-mode').classList.toggle('thinking', state.busy && !active && !state.lastError && !output.streaming);
-    $('output-text').classList.toggle('is-streaming', output.streaming);
+    const feedback = captureFeedback(state);
     $('trace-count').textContent = String(state.events.length);
     $('raw-events').textContent = JSON.stringify({ events: state.events, tasks: state.tasks, trace: state.trace }, null, 2);
     if (feedback?.error) {
@@ -332,6 +404,7 @@
       if (key !== lastCaptureError) { lastCaptureError = key; notice(feedback.text, true); }
     } else if (state.sound2text?.capture?.status === 'listening' && lastCaptureError) { lastCaptureError = ''; notice(''); }
     if (state.sound2text?.error && state.sound2text.error !== lastSoundError) { lastSoundError = state.sound2text.error; notice(lastSoundError, true); }
+    else if (state.sound2text?.voiceprintNotice && state.sound2text.voiceprintNotice !== lastVoiceprintNotice) { lastVoiceprintNotice = state.sound2text.voiceprintNotice; notice(lastVoiceprintNotice, false); }
     renderViews(); controls();
   }
   function renderSpeakerNotes(notes) {
@@ -361,6 +434,9 @@
     try {
       const value = await request('/api/model/config'); if (current !== generation) return; displayConfig(value, true);
       const next = await request('/api/state'); if (current !== generation) return; applyState(next);
+      if (Array.isArray(next.context?.trace)) request('/api/context/trace').then(history => {
+        if (current === generation) renderContextTrace(history.entries);
+      }).catch(error => { if (current === generation) $('context-trace-count').title = `完整轨迹加载失败：${error.message}`; });
       if (typeof EventSource === 'undefined') throw new Error('当前浏览器不支持 SSE。');
       source = new EventSource(api('/api/events'));
       const receive = event => { if (current !== generation) return; try { applyState(JSON.parse(event.data)); connected = true; controls(); } catch (error) { connected = false; notice(error.message, true); controls(); } };
@@ -369,13 +445,13 @@
       source.onerror = () => { if (current !== generation) return; fetch(api('/api/state')).then(response => { if (response.status === 401) location.assign(api('/login')); }); connected = false; notice('实时连接中断，正在重连；不会切换为模拟模型。', true); controls(); };
     } catch (error) { if (current === generation) { connected = false; notice(error.message, true); controls(); } }
   }
+  $('voiceprints-link').addEventListener('click', () => { location.assign(api('/voiceprints.html')); });
   $('close-settings').addEventListener('click', () => $('model-settings').close());
   $('model-form').addEventListener('input', () => { formDirty = true; });
-  $('worker-uses-router').addEventListener('change', toggleWorker);
   $('model-form').addEventListener('submit', async event => {
     event.preventDefault(); if (saving || state?.busy) return;
     try {
-      const body = modelSubmission({ routerBaseURL: $('router-base-url').value, routerModel: $('router-model').value, routerApiKey: $('router-api-key').value, workerUsesRouter: $('worker-uses-router').checked, workerBaseURL: $('worker-base-url').value, workerModel: $('worker-model').value, workerApiKey: $('worker-api-key').value });
+      const body = modelSubmission({ routerBaseURL: $('router-base-url').value, routerModel: $('router-model').value, routerApiKey: $('router-api-key').value, workerUsesRouter: true });
       saving = true; controls();
       const result = await request('/api/model/config', body); formDirty = false; displayConfig(result, true);
       $('config-feedback').textContent = '已保存，未验证连接。'; notice(''); applyState(await request('/api/state'));
@@ -386,21 +462,40 @@
   async function sendConfirm() {
     const voice = audioState(state, localAudioStatus);
     if (!connected || !voice.running || voice.busyAudio || voice.capturing === 'finishing' || !(config?.configured === true || state?.mode === 'mock')) return;
+    if (!lastSentence(mainCaption(state))) return;
     try {
       const next = interactionRequest(state, '', localAudioStatus);
-      dictating = true; controls(); notice('');
-      next.body.boundaryMs = await audio.checkpoint();
-      await request(next.path, next.body);
+      dictating = true; agentOpen = true; agentPhase = 'wait'; controls(); renderAgent(); notice('');
+      const result = await request(next.path, next.body);
       applyState(await request('/api/state'));
-    } catch (error) { notice(error.message, true); }
+      if (result?.skipped) { agentOpen = false; agentPhase = 'idle'; }
+      else if (agentPhase === 'wait' && !state?.busy) agentPhase = 'idle';
+      renderAgent(); controls();
+    } catch (error) { agentPhase = 'idle'; notice(error.message, true); if (agentOpen) paintAgent(error.message, false); }
     finally { dictating = false; controls(); }
   }
   $('submit-form').addEventListener('submit', event => {
     event.preventDefault(); if ($('submit-button').disabled) return;
     confirmChain = confirmChain.then(sendConfirm, sendConfirm);
   });
+  $('close-agent').addEventListener('click', () => {
+    agentOpen = false; agentPhase = 'idle'; renderAgent(); controls();
+  });
+  $('open-agent').addEventListener('click', () => {
+    if ($('open-agent').disabled) return;
+    agentOpen = true; if (!state?.busy) agentPhase = 'idle'; renderAgent(); controls();
+  });
+  $('open-function').addEventListener('click', async () => {
+    if ($('open-function').disabled) return;
+    try {
+      closing = true; controls(); notice('');
+      await request('/api/function/open', {});
+      applyState(await request('/api/state'));
+    } catch (error) { notice(error.message, true); }
+    finally { closing = false; controls(); }
+  });
   async function closeFunction() {
-    if ($('esc-button').disabled || !(state?.subtitle?.active || state?.speaker?.active)) return;
+    if ($('esc-button').disabled || !state?.speaker?.active) return;
     try {
       closing = true; controls(); notice('');
       await request('/api/interaction', {});

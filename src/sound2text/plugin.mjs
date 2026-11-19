@@ -1,11 +1,12 @@
 import { Service } from '@deepseek-ai/cordis';
 import { Sound2Text } from './service.mjs';
+import { VoiceprintDirectory, VOICEPRINT_LIMIT } from './voiceprints.mjs';
 
 /** Cordis-owned ASR lifecycle. Public service delegates to the independently testable engine. */
 export default class Sound2TextPlugin extends Service {
   constructor(ctx, config = {}) {
     super(ctx, 'sound2text');
-    this.engine = new Sound2Text({ configPath: config.configPath });
+    this.engine = new Sound2Text({ configPath: config.configPath, loadVoiceprints: () => this.matchIds() });
     this.events = this.engine.events;
     this.ready = this.engine.ready;
     ctx.effect(() => async () => this.engine.dispose());
@@ -18,4 +19,13 @@ export default class Sound2TextPlugin extends Service {
   armCapture(boundaryMs) { return this.engine.armCapture(boundaryMs); }
   finishCapture(reason, boundaryMs) { return this.engine.finishCapture(reason, boundaryMs); }
   cancelCapture(reason) { return this.engine.cancelCapture(reason); }
+  voiceprints() {
+    const apiKey = this.engine.config?.apiKey;
+    if (!apiKey) throw Object.assign(new Error('请先填写 SOUND2TEXT_API_KEY'), { status: 409 });
+    return new VoiceprintDirectory({ apiKey });
+  }
+  async matchIds() {
+    const items = await this.voiceprints().listAll();
+    return items.slice(0, VOICEPRINT_LIMIT).map(item => item.id);
+  }
 }

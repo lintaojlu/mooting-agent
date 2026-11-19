@@ -1,19 +1,18 @@
 import { appendFile, chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { InputError } from './tasks.mjs';
-import { ContextSystem } from './context.mjs';
 
-/** One directory per account. Memory, fragments, session log and workspace all stay inside data/<username>/. */
+/**
+ * One directory per account for the session log and workspace.
+ * Memory is not per account: every account shares the one ContextSystem passed in (single user, single bank).
+ */
 export class UserHomes {
-  constructor({ dataRoot, accounts, envPath, env, complete } = {}) {
+  constructor({ dataRoot, accounts, context = null } = {}) {
     if (!dataRoot) throw new Error('缺少数据目录');
     if (!Array.isArray(accounts) || accounts.length === 0) throw new Error('缺少用户列表');
     this.dataRoot = resolve(dataRoot);
     this.accounts = Object.freeze([...accounts]);
-    this.envPath = envPath;
-    this.env = env;
-    this.complete = complete;
-    this.contexts = new Map();
+    this.shared = context;
     this.logs = new Map();
     this.workspaces = new Map();
     this.chains = new Map();
@@ -31,13 +30,11 @@ export class UserHomes {
       await chmod(dir, 0o700);
       this.logs.set(username, await readJsonLines(join(dir, 'session.jsonl')));
       this.workspaces.set(username, await readJson(join(dir, 'workspace.json')));
-      const context = new ContextSystem({ memoryPath: join(dir, 'MEMORY.md'), envPath: this.envPath, env: this.env, complete: this.complete });
-      this.contexts.set(username, context);
     }
-    await Promise.all([...this.contexts.values()].map(context => context.ready));
   }
+  /** The shared context for a known account; undefined for an unknown one. */
   context(username) {
-    return this.contexts.get(username);
+    return this.accounts.includes(username) ? this.shared : undefined;
   }
   workspace(username) {
     return this.workspaces.get(username) ?? {};
@@ -71,8 +68,6 @@ export class UserHomes {
   }
   async dispose() {
     await this.idle();
-    await Promise.all([...this.contexts.values()].map(context => context.dispose()));
-    this.contexts.clear();
   }
 }
 

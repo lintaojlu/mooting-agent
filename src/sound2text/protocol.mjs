@@ -31,6 +31,9 @@ export function decodeResponse(value) {
   return { data, sequence, event, code, terminal: !!(flags & 2) };
 }
 
-export function createInitPayload(endWindowMs = 800) {
-  return { user: { uid: 'mooting-agent' }, audio: { format: 'pcm', codec: 'raw', rate: 16000, bits: 16, channel: 1 }, request: { model_name: 'bigmodel', enable_itn: true, enable_punc: true, enable_nonstream: true, show_utterances: true, result_type: 'full', end_window_size: endWindowMs } };
+export function createInitPayload(endWindowMs = 800, voiceprintIds = []) {
+  const ids = [...new Set((voiceprintIds ?? []).map(id => String(id ?? '').trim()).filter(Boolean))].slice(0, 50);
+  const request = { model_name: 'bigmodel', enable_itn: true, enable_punc: true, enable_nonstream: true, show_utterances: true, enable_speaker_info: true, result_type: 'full', end_window_size: endWindowMs };
+  if (ids.length) request.voiceprints = ids.map(id => ({ id }));
+  return { user: { uid: 'mooting-agent' }, audio: { format: 'pcm', codec: 'raw', rate: 16000, bits: 16, channel: 1 }, request };
 }
