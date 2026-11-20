@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="com.s23u.atomicservice.permission.BIND_ATOMIC_SERVICE" />
+    <!-- 经典蓝牙 RFCOMM 调试：Android 12 起需要运行时权限 BLUETOOTH_CONNECT -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+    <!-- 搜索附近蓝牙；neverForLocation 让我们不必再申请定位权限 -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+    <queries>
+        <package android:name="com.s23u.atomicservice" />
+    </queries>
+    <application
+        android:allowBackup="false"
+        android:networkSecurityConfig="@xml/mooting_network_security"
+        android:label="S23U 原子助手"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme">
+        <activity android:name=".MainActivity" android:exported="true"
+            android:screenOrientation="portrait">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity android:name=".BluetoothProbeActivity" android:exported="false"
+            android:label="蓝牙链路自检" android:screenOrientation="portrait" />
+        <activity android:name=".ModelConfigActivity" android:exported="false"
+            android:label="模型配置" android:screenOrientation="portrait" />
+        <activity android:name=".MootingAgentActivity" android:exported="false"
+            android:process=":mooting" android:label="MootingAgent" />
+        <activity android:name=".MemoryActivity" android:exported="false"
+            android:label="记忆库" android:screenOrientation="portrait" />
+        <activity android:name=".GlassesProbeActivity" android:exported="false"
+            android:label="蓝牙连接调试（智能眼镜联调）" android:screenOrientation="portrait" />
+    </application>
+</manifest>

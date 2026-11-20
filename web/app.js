@@ -228,8 +228,12 @@
   let state, config, source, connected = false, dictating = false, closing = false, saving = false, generation = 0, configLoaded = false, formDirty = false;
   let agentOpen = false, agentPhase = 'idle';
   let audio, localAudioStatus = 'idle', lastSoundError = '', lastCaptureError = '', lastVoiceprintNotice = '';
+  const androidControls = document.querySelector('#android-controls');
+  const android = androidControls !== null;
+  let confirmedCapture = '';
+  let submittingAndroid = false;
   const captureClass = root.MootingAudio?.AudioCapture;
-  if (captureClass) audio = new captureClass({ onStatus: status => { localAudioStatus = status; controls(); }, onError: message => notice(message, true) });
+  if (!android && captureClass) audio = new captureClass({ onStatus: status => { localAudioStatus = status; controls(); }, onError: message => notice(message, true) });
   function notice(message, error = false) { $('notice').textContent = message; $('notice').hidden = !message; $('notice').classList.toggle('error', error); }
   function controls() {
     const configured = config?.configured === true || state?.mode === 'mock';
@@ -256,6 +260,24 @@
     $('audio-toggle').title = voice.active ? '暂停语音输入' : '开启语音输入';
     $('audio-toggle').querySelector('.play-symbol').toggleAttribute('hidden', voice.active);
     $('audio-toggle').querySelector('.pause-symbol').toggleAttribute('hidden', !voice.active);
+    if (android) {
+      const capture = state?.sound2text?.capture;
+      androidControls.hidden = false;
+      androidControls.querySelector('#android-send').disabled = !configured || !connected || submittingAndroid;
+      androidControls.querySelector('#android-cancel').disabled = !connected || !state?.busy;
+      $('audio-toggle').disabled = !connected || !state?.sound2text?.configured || voice.busyAudio;
+      $('submit-button').disabled = !connected || !voice.running || !configured || capture?.status === 'finishing' || !!capture?.review;
+      const label = capture?.status === 'listening' ? '结束收集' : '收集语音指令';
+      $('submit-button').textContent = label;
+      $('submit-button').setAttribute('aria-label', label);
+      const dialog = androidControls.querySelector('#android-confirm');
+      if (capture?.review && capture.id !== confirmedCapture) {
+        confirmedCapture = capture.id;
+        androidControls.querySelector('#android-confirm-text').value = capture.review;
+        if (!dialog.open) dialog.showModal();
+      }
+      if (dialog.open && !capture?.review && !submittingAndroid) dialog.close();
+    }
     const name = String($('speaker-name-input')?.value ?? '').trim();
     $('save-social-card').disabled = !connected || closing || !draft || !name;
     $('discard-social-card').disabled = !connected || closing || !draft;
@@ -633,6 +655,11 @@
   }
   $('submit-form').addEventListener('submit', event => {
     event.preventDefault(); if ($('submit-button').disabled) return;
+    if (android) {
+      const action = state?.sound2text?.capture?.status === 'listening' ? 'review' : 'arm';
+      request('/api/android/audio', { action }).catch(error => notice(error.message, true));
+      return;
+    }
     confirmChain = confirmChain.then(sendConfirm, sendConfirm);
   });
   $('open-agent').addEventListener('click', () => {
@@ -687,6 +714,12 @@
     closeFunction();
   });
   $('audio-toggle').addEventListener('click', async () => {
+    if (android) {
+      const action = state?.sound2text?.status === 'running' ? 'stop' : 'start';
+      try { notice(''); await request('/api/android/audio', { action }); }
+      catch (error) { notice(error.message, true); }
+      return;
+    }
     if (!audio || !connected) return;
     try {
       if (audio.status !== 'idle' || audioState(state).active) await audio.pause();
@@ -697,6 +730,51 @@
       applyState(await request('/api/state'));
     } catch (error) { notice(error.message, true); controls(); }
   });
+  if (android) {
+    function updateAndroidStatus() {
+      request('/api/android/status').then(value => {
+        const speech = value.speech ? '语音已连接' : value.speechError || '等待原子语音服务';
+        const model = value.structured ? '本机模型已连接' : value.structuredError || '等待 s23u.agent.atomic.v1';
+        const memory = value.memoryError || (value.memory === 'ready' ? 'Hindsight 已连接' : '等待 Hindsight');
+        androidControls.querySelector('#android-status').textContent = [speech, model, memory, value.queueError].filter(Boolean).join(' · ');
+      }).catch(error => { androidControls.querySelector('#android-status').textContent = error.message; });
+    }
+    const sendAndroid = async (path, body) => {
+      submittingAndroid = true;
+      controls();
+      try {
+        await request(path, body);
+        agentOpen = true;
+        agentPhase = 'wait';
+        applyState(await request('/api/state'));
+      } catch (error) {
+        notice(error.message, true);
+        return false;
+      } finally {
+        submittingAndroid = false;
+        controls();
+      }
+      return true;
+    };
+    androidControls.querySelector('#android-text-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const field = androidControls.querySelector('#android-text-input');
+      if (!submittingAndroid && await sendAndroid('/api/android/text', { instruction: field.value })) field.value = '';
+    });
+    androidControls.querySelector('#android-confirm-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      if (!submittingAndroid) await sendAndroid('/api/android/submit', {
+        id: confirmedCapture, instruction: androidControls.querySelector('#android-confirm-text').value,
+      });
+    });
+    const discard = () => request('/api/android/audio', { action: 'discard' }).catch(error => notice(error.message, true));
+    androidControls.querySelector('#android-discard').addEventListener('click', discard);
+    androidControls.querySelector('#android-confirm').addEventListener('cancel', event => { event.preventDefault(); void discard(); });
+    androidControls.querySelector('#android-cancel').addEventListener('click', () => request('/api/interaction', {}).catch(error => notice(error.message, true)));
+    const timer = setInterval(updateAndroidStatus, 3000);
+    updateAndroidStatus();
+    window.addEventListener('pagehide', () => clearInterval(timer), { once: true });
+  }
   window.addEventListener('beforeunload', () => { clearInterval(clockTimer); stopStream(); source?.close(); audio?.pause(); });
   controls(); connect();
 })(globalThis);

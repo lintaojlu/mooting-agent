@@ -1,0 +1,18 @@
+    <section id="android-controls" class="panel android-controls" aria-label="设备端指令" hidden>
+      <p id="android-status" role="status">正在连接设备服务…</p>
+      <form id="android-text-form">
+        <label for="android-text-input">输入指令</label>
+        <textarea id="android-text-input" rows="2" maxlength="2000" required></textarea>
+        <button id="android-send" class="primary-button" type="submit">发送</button>
+        <button id="android-cancel" class="esc-button" type="button" disabled>中断 Agent</button>
+      </form>
+      <dialog id="android-confirm" class="settings-dialog" aria-labelledby="android-confirm-title">
+        <form id="android-confirm-form" class="android-controls">
+          <h2 id="android-confirm-title">确认语音指令</h2>
+          <label for="android-confirm-text">检查并编辑转写后发送</label>
+          <textarea id="android-confirm-text" rows="4" maxlength="2000" required></textarea>
+          <button class="primary-button" type="submit">确认发送</button>
+          <button id="android-discard" class="esc-button" type="button">取消</button>
+        </form>
+      </dialog>
+    </section>

@@ -132,7 +132,7 @@ export function publicServiceSettings(config) {
   const key = config.daemonEnv?.HINDSIGHT_API_LLM_API_KEY;
   const memoryModel = { configured: true, model: config.llm?.model || '', baseURL: config.llm?.baseURL || '', hasApiKey: Boolean(key && key !== 'none') };
   if (config.embedding !== 'remote') return { memoryModel, embedding: { configured: true, mode: '本地', model: LOCAL_EMBEDDING_MODEL, baseURL: '', hasApiKey: false } };
-  return { memoryModel, embedding: { configured: true, mode: '远程', model: config.daemonEnv?.HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL || '', baseURL: config.daemonEnv?.HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL || '', hasApiKey: Boolean(config.daemonEnv?.HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY) } };
+  return { memoryModel, embedding: { configured: true, mode: config.localAtomic ? '本机原子服务' : '远程', model: config.daemonEnv?.HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL || '', baseURL: config.daemonEnv?.HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL || '', hasApiKey: Boolean(config.daemonEnv?.HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY) } };
 }
 
 function anySignal(signals) {
@@ -221,11 +221,11 @@ class CancellableHindsightServer extends HindsightServer {
  * status: unconfigured | disabled | starting | ready | offline.
  */
 export class HindsightBridge extends EventEmitter {
-  constructor({ env, envPath, profile = DEFAULT_PROFILE, port, bank = DEFAULT_BANK, embedVersion = EMBED_VERSION, readyTimeoutMs = 30 * 60_000, healthIntervalMs = 15_000, manageDaemon = true, mentalModelTrigger, logger } = {}) {
+  constructor({ env, envPath, profile = DEFAULT_PROFILE, port, bank = DEFAULT_BANK, embedVersion = EMBED_VERSION, readyTimeoutMs = 30 * 60_000, healthIntervalMs = 15_000, manageDaemon = true, localEndpoint, mentalModelTrigger, logger } = {}) {
     super();
     this.env = env; this.envPath = envPath; this.profile = profile; this.portOverride = port; this.bank = bank;
     this.embedVersion = embedVersion; this.readyTimeoutMs = readyTimeoutMs; this.healthIntervalMs = healthIntervalMs;
-    this.manageDaemon = manageDaemon; this.logger = logger ?? quietLogger;
+    this.manageDaemon = manageDaemon && !localEndpoint; this.localEndpoint = localEndpoint; this.logger = logger ?? quietLogger;
     this.mentalModelTrigger = { mode: 'delta', refreshAfterConsolidation: true, minRefreshIntervalSeconds: 600, ...mentalModelTrigger };
     this.status = 'starting'; this.error = undefined; this.config = { configured: false };
     this.stopped = false; this.timer = null; this.starting = null;
@@ -240,6 +240,12 @@ export class HindsightBridge extends EventEmitter {
     if (status === 'ready') this.emit('ready');
   }
   async loadConfig() {
+    if (this.localEndpoint) {
+      this.config = { enabled: true, configured: true, llm: { model: this.localEndpoint.model },
+        embedding: 'remote', localAtomic: true,
+        daemonEnv: { HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL: this.localEndpoint.embeddingModel } };
+      return this.config;
+    }
     const file = this.envPath ? await readModelEnv(this.envPath) : {};
     try { this.config = loadHindsightConfig({ ...process.env, ...file, ...this.env }); }
     catch (error) { this.config = { configured: false, enabled: true }; this.setStatus('unconfigured', error.message); return this.config; }
@@ -258,15 +264,22 @@ export class HindsightBridge extends EventEmitter {
     if (this.stopped || this.status === 'unconfigured') return;
     if (!this.config.enabled) { this.setStatus('disabled'); return; }
     if (!this.config.configured) { this.setStatus('unconfigured', '请在 .env 中配置 MOOTING_CONTEXT_BASE_URL 和 MOOTING_CONTEXT_MODEL（或 MOOTING_HINDSIGHT_LLM_*）'); return; }
-    this.baseUrl = `http://127.0.0.1:${this.config.port}`;
-    this.client = new HindsightClient({ baseUrl: this.baseUrl, userAgent: 'mooting-agent', maxAttempts: 1 });
+    this.baseUrl = this.localEndpoint?.url ?? `http://127.0.0.1:${this.config.port}`;
+    this.client = new HindsightClient({ baseUrl: this.baseUrl, apiKey: this.localEndpoint?.apiKey, userAgent: 'mooting-agent', maxAttempts: 1 });
     this.rawClient = this.client.client;
     // hey-api catches fetch exceptions and the high-level SDK wraps them in HindsightError,
     // dropping the DOMException name and network cause. Preserve only transport errors here;
     // HTTP errors still follow the SDK path with their statusCode intact.
     this.rawClient.interceptors.error.use((error, response) => { if (!response) throw error; return error; });
     const daemonEnv = { ...this.config.daemonEnv, HINDSIGHT_EMBED_DAEMON_STARTUP_TIMEOUT: String(Math.ceil(this.readyTimeoutMs / 1000)) };
-    this.server = new CancellableHindsightServer({ profile: this.profile, port: this.config.port, embedVersion: this.embedVersion, env: daemonEnv, readyTimeoutMs: this.readyTimeoutMs, readyPollIntervalMs: 2_000, logger: this.logger }, this.lifecycle.signal);
+    this.server = this.localEndpoint ? {
+      checkHealth: async () => {
+        const signal = anySignal([this.lifecycle.signal, AbortSignal.timeout(2500)]);
+        const headers = { Authorization: 'Bearer ' + this.localEndpoint.apiKey };
+        try { return (await fetch(this.baseUrl + '/health', { headers, signal })).ok; }
+        catch { return false; }
+      },
+    } : new CancellableHindsightServer({ profile: this.profile, port: this.config.port, embedVersion: this.embedVersion, env: daemonEnv, readyTimeoutMs: this.readyTimeoutMs, readyPollIntervalMs: 2_000, logger: this.logger }, this.lifecycle.signal);
     this.setStatus('starting');
     try {
       if (this.manageDaemon && !(await this.server.checkHealth())) await this.server.start();

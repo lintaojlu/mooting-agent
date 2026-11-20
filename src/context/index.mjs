@@ -216,11 +216,12 @@ export class ContextSystem extends EventEmitter {
       const raw = utterance.text.trim().slice(0, UTTERANCE_LIMIT);
       const text = speaker ? `${speaker}：${raw}` : raw;
       if (!text || !Number.isFinite(utterance.start_time)) continue;
-      const key = `${utterance.start_time}\0${text}`;
+      const timestamp = Number.isSafeInteger(utterance.occurredAtMs) && utterance.occurredAtMs > 0 ? utterance.occurredAtMs : undefined;
+      const key = `${timestamp ?? utterance.start_time}\0${text}`;
       if (this.seen.has(key)) continue;
       this.seen.add(key);
       if (this.seen.size > 400) this.seen.delete(this.seen.values().next().value);
-      const at = new Date(this.now()).toISOString();
+      const at = new Date(timestamp ?? this.now()).toISOString();
       const fragment = { at, text };
       this.fragments.push(fragment);
       if (this.fragments.length > FRAGMENT_RAM) this.fragments.splice(0, this.fragments.length - FRAGMENT_RAM);

@@ -106,10 +106,11 @@ const PROMPT = `用户消息里「## 用户指令」之前的内容是语音背�
 
 /** One DSH Session. The router calls function tools in its own turn. */
 export class MootingRuntime extends EventEmitter {
-  constructor(ctx, { mode = 'live', provider = 'mooting-live', model = 'unconfigured', models, sound2text, context, homes, workers, socialCardRoot } = {}) {
+  constructor(ctx, { mode = 'live', provider = 'mooting-live', model = 'unconfigured', models, sound2text, context, homes, workers, socialCardRoot, archiveReply, deviceGraph } = {}) {
     super(); this.ctx = ctx; this.mode = mode; this.provider = provider; this.model = model; this.models = models; this.homes = homes ?? null; this.context = context ?? homes?.shared ?? null; this.actor = undefined; this.audioOwner = undefined; this.lastUser = undefined;
     this.stream = null; this.currentContext = null; this.lastError = null; this.turnMemory = '';
     this.workers = workers ?? null; this.pendingReports = []; this.reportScheduled = false; this.turn = null;
+    this.archiveReply = archiveReply; this.deviceGraph = deviceGraph;
     this.trace = []; this.sequence = 0; this.busy = false; this.pending = undefined; this.current = undefined;
     this.sound2text = sound2text; this.humanInteraction = false; this.cancelling = false;
     this.snapshots = new Map(); this.closed = false; this.notifications = []; this.errors = [];
@@ -276,7 +277,11 @@ export class MootingRuntime extends EventEmitter {
         if (event.type === 'assistant/message') {
           const text = (event.data.message?.content ?? []).filter(b => b.type === 'text').map(b => b.text).join('');
           if (text) this.record('router.answer', { text }, undefined, 'router');
-          if (text && this.turn) this.turn.assistant.push(text);
+          if (this.turn) {
+            if (text) this.turn.assistant.push(text);
+            const usesTools = event.data.message?.content?.some(block => block.type === 'tool-call');
+            this.turn.finalAnswer = usesTools ? '' : text;
+          }
         }
         if (event.type === 'turn/end') this.endTurn(event.data?.reason);
       }),
@@ -318,6 +323,8 @@ export class MootingRuntime extends EventEmitter {
             register('memory_search', '只读：在长期记忆里查具体事实、原话或时间。3 秒内返回；不可用或超时时返回空结果和说明。', (signal, args) => this.memorySearch(args.query, signal), query),
             register('memory_reflect', '只读：后台综合很多条长期记忆回答一个问题，适合「为什么」「总结一下」。立即返回「已受理」，结果稍后作为回报送达。', (_signal, args) => this.memoryReflect(args.query), query),
           ];
+          if (this.deviceGraph) disposers.push(register('social_graph', '只读：查看本机联系人和关系图谱。', this.deviceGraph,
+            { type: 'object', additionalProperties: false }));
           return () => { for (const dispose of disposers) dispose(); };
         });
       },
@@ -444,10 +451,14 @@ export class MootingRuntime extends EventEmitter {
     const turn = this.turn; this.turn = null;
     if (!turn || !this.context || reason?.kind !== 'completed' || this.cancelling) return;
     const input = turn.input;
-    const assistant = turn.assistant.join('\n').trim();
+    const assistant = (this.archiveReply ? turn.finalAnswer ?? '' : turn.assistant.join('\n')).trim();
     if (!assistant) return;
     if (input?.kind === 'memory_report') this.context.recordTurn({ inputId: input.id, report: input.report, assistant });
     else this.context.recordTurn({ inputId: input?.id, user: input?.instruction ?? turn.user, assistant });
+    if (this.archiveReply && input?.id && input.kind !== 'memory_report') {
+      this.archiveReply({ sourceId: input.id, text: input.instruction ?? turn.user, reply: assistant })
+        .catch(error => this.record('archive.error', { error: error.message }));
+    }
   }
   async memorySearch(query, signal) {
     if (!this.context) return { available: false, results: [], note: '记忆未启用' };

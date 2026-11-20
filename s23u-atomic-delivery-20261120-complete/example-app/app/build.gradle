@@ -1,0 +1,163 @@
+plugins { id 'com.android.application' }
+
+def upgradeKey = providers.environmentVariable('MOOTING_UPGRADE_KEYSTORE')
+def upgradeAlias = providers.environmentVariable('MOOTING_UPGRADE_KEY_ALIAS')
+def upgradeStorePassword = providers.environmentVariable('MOOTING_UPGRADE_STORE_PASSWORD')
+def upgradeKeyPassword = providers.environmentVariable('MOOTING_UPGRADE_KEY_PASSWORD')
+android {
+    namespace 'com.s23u.atomicclient'
+    compileSdk 36
+    defaultConfig {
+        applicationId 'com.s23u.atomicclient'
+        minSdk 26
+        targetSdk 36
+        versionCode 2
+        versionName '2.0.0-alpha1'
+        ndk { abiFilters 'arm64-v8a' }
+    }
+    signingConfigs {
+        if (upgradeKey.isPresent()) {
+            upgrade {
+                storeFile rootProject.file(upgradeKey.get())
+                keyAlias upgradeAlias.get()
+                storePassword upgradeStorePassword.get()
+                keyPassword upgradeKeyPassword.get()
+            }
+        }
+    }
+    buildTypes {
+        debug {
+            debuggable true
+            minifyEnabled false
+            if (upgradeKey.isPresent()) signingConfig signingConfigs.upgrade
+        }
+        release {
+            minifyEnabled false
+            if (upgradeKey.isPresent()) signingConfig signingConfigs.upgrade
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    androidResources { noCompress += ['wav', 'zip'] }
+    buildFeatures { aidl true }
+    packaging { jniLibs { useLegacyPackaging = true } }
+    ndkVersion providers.gradleProperty('android.ndk.version').getOrElse('30.0.16248370')
+    def localNdkPath = providers.gradleProperty('ndk.local.path').orNull
+    if (localNdkPath) ndkPath localNdkPath
+    defaultConfig.externalNativeBuild.cmake.arguments '-DANDROID_STL=c++_shared'
+    externalNativeBuild {
+        cmake {
+            path 'src/main/cpp/CMakeLists.txt'
+            version '3.22.1'
+        }
+    }
+}
+
+dependencies { implementation files('libs/atomic-api-debug.aar') }
+
+def agentRoot = rootProject.file('../..')
+def mootingFiles = layout.buildDirectory.dir('mooting')
+def nodeVersion = '24.22.1-0'
+def nodeHash = 'd6fd9f610fe5d81fede8f0d400c5a62723247725a19831835f15abf4f0604250'
+def nodeArchive = providers.gradleProperty('mooting.node.archive')
+def pythonArchive = providers.gradleProperty('mooting.hindsight.runtime')
+def pythonHash = providers.gradleProperty('mooting.hindsight.sha256')
+def stagePython = tasks.register('stageMootingPython', Sync) {
+    into mootingFiles.map { it.dir('python-runtime') }
+    if (pythonArchive.isPresent()) {
+        def source = rootProject.file(pythonArchive.get())
+        inputs.property('runtimeHash', pythonHash.getOrElse(''))
+        from(zipTree(source))
+        doFirst {
+            def digest = java.security.MessageDigest.getInstance('SHA-256')
+            source.withInputStream { stream ->
+                new java.security.DigestInputStream(stream, digest).transferTo(OutputStream.nullOutputStream())
+            }
+            if (digest.digest().encodeHex().toString() != pythonHash.getOrElse('')) {
+                throw new GradleException('Hindsight Android runtime SHA-256 mismatch')
+            }
+            new java.util.zip.ZipFile(source).withCloseable { zip ->
+                def required = ['jni/arm64-v8a/libmooting-python.so', 'python/lib/python3.14/os.py',
+                                'python/site-packages/asyncpg/__init__.py', 'python/site-packages/uvicorn/__init__.py',
+                                'python/site-packages/psycopg2/__init__.py', 'jni/arm64-v8a/libpython3.14.so']
+                if (!required.every { zip.getEntry(it) != null }) {
+                    throw new GradleException('Hindsight Android runtime ZIP layout is incomplete')
+                }
+            }
+        }
+    }
+}
+def packageAgent = tasks.register('packageMootingAgent', Zip) {
+    destinationDirectory = mootingFiles.map { it.dir('assets') }
+    archiveFileName = 'mooting-agent.zip'
+    reproducibleFileOrder = true
+    preserveFileTimestamps = false
+    from(agentRoot) {
+        include 'src/**/*.mjs', 'src/android/hindsight_bootstrap.py', 'package.json', 'web/*.js', 'web/*.css', 'web/*.html'
+    }
+    if (pythonArchive.isPresent()) {
+        dependsOn(stagePython)
+        from(mootingFiles.map { it.dir('python-runtime') }) { include 'python/**' }
+        from(new File(agentRoot, 'vendor/hindsight/hindsight-api-slim')) {
+            into 'hindsight'
+            include 'hindsight_api/**'
+            exclude '**/__pycache__/**', '**/*.pyc'
+        }
+        from(new File(agentRoot, 'vendor/hindsight/LICENSE')) { into 'hindsight' }
+    }
+    from(new File(agentRoot, 'vendor/node_modules')) {
+        into 'node_modules'
+        exclude '**/*.node', '**/.DS_Store'
+    }
+}
+def packageNode = tasks.register('packageMootingNode') {
+    inputs.property('nodeVersion', nodeVersion)
+    inputs.property('nodeHash', nodeHash)
+    if (nodeArchive.isPresent()) inputs.file(rootProject.file(nodeArchive.get()))
+    def output = mootingFiles.map { it.file('jni/arm64-v8a/libnode.so') }
+    outputs.file(output)
+    doLast {
+        def archive = nodeArchive.isPresent() ? rootProject.file(nodeArchive.get()) :
+                new File(temporaryDir, "nodejs-mobile-android-${nodeVersion}.zip")
+        if (!archive.exists() && !nodeArchive.isPresent()) {
+            def url = new URI("https://github.com/fogtape/nodejs-mobile/releases/download/v${nodeVersion}/nodejs-mobile-android-${nodeVersion}.zip").toURL()
+            def connection = url.openConnection()
+            connection.connectTimeout = 15000
+            connection.readTimeout = 60000
+            def partial = new File(temporaryDir, 'node.zip.part')
+            connection.inputStream.withCloseable { source ->
+                partial.withOutputStream { source.transferTo(it) }
+            }
+            java.nio.file.Files.move(partial.toPath(), archive.toPath())
+        }
+        def digest = java.security.MessageDigest.getInstance('SHA-256')
+        archive.withInputStream { stream ->
+            new java.security.DigestInputStream(stream, digest).transferTo(OutputStream.nullOutputStream())
+        }
+        if (digest.digest().encodeHex().toString() != nodeHash) {
+            if (!nodeArchive.isPresent()) archive.delete()
+            throw new GradleException('MootingAgent Node archive SHA-256 mismatch')
+        }
+        def target = output.get().asFile
+        target.parentFile.mkdirs()
+        new java.util.zip.ZipFile(archive).withCloseable { zip ->
+            zip.getInputStream(zip.getEntry('bin/arm64-v8a/libnode.so')).withCloseable { source ->
+                target.withOutputStream { source.transferTo(it) }
+            }
+        }
+    }
+}
+android.sourceSets.main.assets.srcDir(mootingFiles.get().dir('assets').asFile)
+android.sourceSets.main.jniLibs.srcDir(mootingFiles.get().dir('jni').asFile)
+tasks.named('preBuild').configure { dependsOn(packageAgent, packageNode) }
+if (pythonArchive.isPresent()) {
+    android.sourceSets.main.jniLibs.srcDir(mootingFiles.get().dir('python-runtime/jni').asFile)
+    tasks.named('preBuild').configure { dependsOn(stagePython) }
+}
+tasks.matching { it.name == 'preReleaseBuild' }.configureEach {
+    doFirst {
+        if (!pythonArchive.isPresent()) throw new GradleException('Release requires the APK-bundled Hindsight Android runtime')
+    }
+}

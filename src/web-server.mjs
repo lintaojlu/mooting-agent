@@ -9,6 +9,8 @@ import { createAccess, forwardedProto, hostDecision, loginDocument, originAllowe
 const WEB = new URL('../web/', import.meta.url);
 const ASSETS = new Map([['/', ['index.html', 'text/html; charset=utf-8']], ['/index.html', ['index.html', 'text/html; charset=utf-8']], ['/voiceprints.html', ['voiceprints.html', 'text/html; charset=utf-8']], ['/voiceprints.js', ['voiceprints.js', 'text/javascript; charset=utf-8']], ['/voiceprint-worklet.js', ['voiceprint-worklet.js', 'text/javascript; charset=utf-8']], ['/boot.js', ['boot.js', 'text/javascript; charset=utf-8']], ['/app.js', ['app.js', 'text/javascript; charset=utf-8']], ['/audio-capture.js', ['audio-capture.js', 'text/javascript; charset=utf-8']], ['/audio-worklet.js', ['audio-worklet.js', 'text/javascript; charset=utf-8']], ['/styles.css', ['styles.css', 'text/css; charset=utf-8']], ['/dsh-views.js', ['dsh-views.js', 'text/javascript; charset=utf-8']], ['/dsh-views.css', ['dsh-views.css', 'text/css; charset=utf-8']]]);
 const SECURITY = { 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'" };
+const ANDROID_SECURITY = { ...SECURITY,
+  'Content-Security-Policy': SECURITY['Content-Security-Policy'] + "; font-src 'self' data:" };
 const json = (res, code, body) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }); res.end(JSON.stringify(body)); };
 async function body(req, limit = 65536) {
   let bytes = 0; const parts = [];
@@ -41,7 +43,7 @@ async function page(filename, base) {
 }
 
 /** HTTP surface. Loopback stays open for local use; a public host requires the account gate and a path prefix. */
-export async function startWeb(runtime, { port = 4317, basePath = '', publicHosts = [], auth = false } = {}) {
+export async function startWeb(runtime, { port = 4317, basePath = '', publicHosts = [], auth = false, android } = {}) {
   const access = createAccess({ basePath, publicHosts, auth });
   const hostedAudio = new HostedAudio();
   const clients = new Set(); let scheduled, closing = false;
@@ -62,6 +64,7 @@ export async function startWeb(runtime, { port = 4317, basePath = '', publicHost
       if (!originAllowed(req, decision)) throw new InputError('不允许跨来源访问', 403);
       if (!decision.loopback && !['GET', 'HEAD'].includes(req.method ?? 'GET') && !req.headers.origin) throw new InputError('不允许跨来源访问', 403);
       const url = new URL(req.url ?? '/', `http://${decision.host}`);
+      if (android && (!decision.loopback || !android.authorize(req))) throw new InputError('应用会话已失效', 403);
       let path = url.pathname;
       if (access.base) {
         if (path === access.base) { res.writeHead(308, { Location: `${access.base}/` }); res.end(); return; }
@@ -106,6 +109,7 @@ export async function startWeb(runtime, { port = 4317, basePath = '', publicHost
       if (req.method === 'GET' && path === '/api/state') return json(res, 200, runtime.state(username));
       if (req.method === 'GET' && path === '/api/context/trace') return json(res, 200, await runtime.contextTrace(username));
       if (req.method === 'GET' && path === '/api/model/config') return json(res, 200, runtime.models?.state() ?? runtime.state(username).modelConfig);
+      if (android && req.method === 'GET' && path === '/api/android/status') return json(res, 200, await android.status());
       if (req.method === 'GET' && path === '/api/health') return json(res, 200, { ok: true, sessionCount: runtime.ctx.agents.list().length, mode: runtime.mode });
       if (req.method === 'GET' && path === '/api/voiceprints') {
         try {
@@ -142,6 +146,9 @@ export async function startWeb(runtime, { port = 4317, basePath = '', publicHost
       if (req.method === 'POST') {
         if (!req.headers['content-type']?.startsWith('application/json')) throw new InputError('Content-Type 必须为 application/json', 415);
         const input = await body(req);
+        if (android && path === '/api/android/audio') return json(res, 200, await android.audio(input.action));
+        if (android && path === '/api/android/submit') return json(res, 202, await android.submit(input));
+        if (android && path === '/api/android/text') return json(res, 202, await runtime.submit(input));
         if (path === '/api/model/config') return json(res, 200, await runtime.configureModels(input));
         if (path === '/api/social-card/create') return json(res, 200, await runtime.createSocialCard(input, username));
         if (path === '/api/owner-speaker') return json(res, 200, runtime.setOwnerSpeaker(input?.name, username));
@@ -155,14 +162,20 @@ export async function startWeb(runtime, { port = 4317, basePath = '', publicHost
       }
       if (req.method === 'GET' && ASSETS.has(path)) {
         const [filename, type] = ASSETS.get(path);
-        const data = filename.endsWith('.html') ? await page(filename, access.base) : await readFile(new URL(filename, WEB));
-        res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-store', ...SECURITY }); res.end(data); return;
+        let data = filename.endsWith('.html') ? await page(filename, access.base) : await readFile(new URL(filename, WEB));
+        if (android && filename === 'index.html') {
+          const controls = await readFile(new URL('android-controls.html', WEB), 'utf8');
+          data = data.replace('<html lang="zh-CN">', '<html lang="zh-CN" data-android>')
+            .replace('<dialog id="model-settings"', controls + '<dialog id="model-settings"');
+        }
+        res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-store', ...(android ? ANDROID_SECURITY : SECURITY) });
+        res.end(data); return;
       }
       json(res, 404, { error: 'Not found' });
     };
     request().catch(error => { if (!res.headersSent) json(res, error.status ?? 500, { error: error.message }); else res.destroy(); });
   });
-  const audioWebSocket = runtime.sound2text ? mountSound2text(server, runtime.sound2text, { publicHosts: access.publicHosts, basePath: access.base, authorize: req => !access.auth || Boolean(access.sessionUser(req)), identify: req => access.sessionUser(req) || '', onOwner: (username, active) => runtime.setAudioOwner?.(username, active) }) : undefined;
+  const audioWebSocket = runtime.sound2text && !android ? mountSound2text(server, runtime.sound2text, { publicHosts: access.publicHosts, basePath: access.base, authorize: req => !access.auth || Boolean(access.sessionUser(req)), identify: req => access.sessionUser(req) || '', onOwner: (username, active) => runtime.setAudioOwner?.(username, active) }) : undefined;
   server.requestTimeout = access.publicHosts.length ? 0 : 10000;
   server.headersTimeout = access.publicHosts.length ? 60000 : 10000;
   try {
