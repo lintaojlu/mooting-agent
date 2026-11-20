@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { HindsightBridge, loadHindsightConfig, withDeadline } from '../src/context/hindsight.mjs';
+import { ContextSystem } from '../src/context/index.mjs';
 
 const env = { MOOTING_CONTEXT_BASE_URL: 'http://localhost:1234/v1', MOOTING_CONTEXT_MODEL: 'test' };
 
@@ -32,6 +36,56 @@ test('bridge deadlines preserve TimeoutError through the real SDK and leave serv
   assert.ok(performance.now() - started < 500);
   assert.equal(bridge.status, 'ready');
   assert.equal(requests.some(url => url.includes('/mental-models/')), false, 'existing.items skips creating existing models');
+});
+
+test('memory_search returns results from a slow first recall and distinguishes cancellation from timeout', async t => {
+  const { bridge } = await transport(t, (req, res) => {
+    if (!req.url.endsWith('/memories/recall')) { res.end('{}'); return; }
+    const timer = setTimeout(() => res.end(JSON.stringify({ results: [{ text: '检索成功' }] })), 3_200);
+    res.once('close', () => clearTimeout(timer));
+  });
+  const root = await mkdtemp(join(tmpdir(), 'mooting-slow-recall-'));
+  const context = new ContextSystem({ dataRoot: root, bridge });
+  t.after(async () => {
+    await context.dispose();
+    await rm(root, { recursive: true, force: true });
+  });
+  await context.ready;
+  const result = await context.search('慢速检索');
+  assert.equal(result.results[0]?.text, '检索成功');
+  const completed = context.state().trace.find(entry => entry.type === 'memory.search.end');
+  assert.ok(completed.data.elapsedMs >= 3_000);
+
+  const signal = AbortSignal.abort(new Error('用户发来新指令'));
+  assert.equal((await context.search('取消的检索', { signal })).note, '记忆检索已取消');
+  context.limits.searchTimeoutMs = 50;
+  assert.match((await context.search('超时的检索')).note, /检索超时/);
+  const failure = context.state().trace.findLast(entry => entry.type === 'memory.search.failed');
+  assert.equal(failure.data.timeoutMs, 50);
+  assert.equal(bridge.status, 'ready');
+});
+
+test('bank clear quiescence cancels deferred jobs and waits for processing jobs', async t => {
+  const job = '00000000-0000-4000-8000-000000000001';
+  let processingChecks = 0;
+  let cancelled = false;
+  const { bridge } = await transport(t, (req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+    if (req.method === 'DELETE' && url.pathname.endsWith('/operations/' + job)) {
+      cancelled = true;
+      res.end('{}');
+      return;
+    }
+    const status = url.searchParams.get('status');
+    if (status === 'pending' && !cancelled) {
+      res.end(JSON.stringify({ operations: [{ id: job, next_retry_at: new Date(Date.now() + 60_000).toISOString() }] }));
+    } else if (status === 'processing' && processingChecks++ === 0) {
+      res.end(JSON.stringify({ operations: [{ id: job, status }] }));
+    } else res.end(JSON.stringify({ operations: [] }));
+  });
+  await bridge.waitForBankWrites();
+  assert.equal(cancelled, true);
+  assert.equal(processingChecks, 3);
 });
 
 test('bridge preserves user cancellation and HTTP status while classifying only connection failures offline', async t => {

@@ -4,12 +4,84 @@ import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { EventEmitter } from 'node:events';
 import { ContextSystem, commandFromPrompt, memoryCommand, LIMITS, MEMORY_NOTE } from '../src/context/index.mjs';
 import { loadHindsightConfig, HindsightBridge, publicServiceSettings } from '../src/context/hindsight.mjs';
 import { harness } from './harness.mjs';
 
 const dir = () => mkdtemp(join(tmpdir(), 'mooting-context-'));
 const utter = (text, start) => ({ text, definite: true, start_time: start, end_time: start + 1 });
+
+test('clear removes persisted memory and suppresses results from earlier reads', async t => {
+  const root = await dir();
+  const bridge = new EventEmitter();
+  bridge.status = 'disabled';
+  const context = new ContextSystem({ dataRoot: root, bridge });
+  t.after(() => context.dispose());
+  await context.ready;
+  context.observe({ status: 'running', utterances: [utter('old fragment', 1)] });
+  context.command('记住 old fact');
+  context.recordTurn({ user: 'old question', assistant: 'old answer' });
+  await context.idle();
+
+  const reading = Promise.withResolvers();
+  const model = Promise.withResolvers();
+  const recall = Promise.withResolvers();
+  bridge.ready = true;
+  bridge.status = 'ready';
+  bridge.mentalModel = () => { reading.resolve(); return model.promise; };
+  bridge.recall = () => recall.promise;
+  const refresh = context.refreshCache();
+  await reading.promise;
+  const search = context.search('old query');
+  const calls = [];
+  bridge.waitForBankWrites = async () => { calls.push('drain'); };
+  bridge.deleteBank = async () => { calls.push('delete'); };
+  bridge.initializeBank = async () => { calls.push('initialize'); };
+  const previous = context.state().trace.at(-1).seq;
+  assert.deepEqual(await context.clearMemory(), { ok: true, longTermCleared: true });
+  assert.deepEqual(calls, ['drain', 'delete', 'initialize']);
+  model.resolve({ content: 'old model' });
+  recall.resolve({ results: [{ text: 'old fact' }] });
+  assert.equal(await refresh, false);
+  assert.deepEqual((await search).results, []);
+  context.observe({ status: 'running', utterances: [utter('old fragment', 1)] });
+  assert.deepEqual(context.state().fragments, []);
+  assert.equal(context.state().outbox, 0);
+  assert.equal(context.state().memory, '');
+  assert.equal(context.state().traceClearedThrough, previous);
+  assert.deepEqual((await context.traceHistory()).map(entry => entry.type), ['memory.clear']);
+  assert.equal(await readFile(join(root, 'fragments.jsonl'), 'utf8'), '');
+  assert.equal(await readFile(join(root, 'hindsight-outbox.jsonl'), 'utf8'), '');
+  assert.deepEqual(JSON.parse(await readFile(join(root, 'memory-cache.json'), 'utf8')), { models: {}, explicit: [], tombstones: [], fetchedAt: null });
+  context.observe({ status: 'running', utterances: [utter('new fragment', 2)] });
+  assert.equal(context.state().fragments[0].text, 'new fragment');
+});
+
+test('an interrupted clear cannot reload older memory and can be retried after restart', async t => {
+  const root = await dir();
+  const bridge = Object.assign(new EventEmitter(), {
+    ready: true, status: 'ready', waitForBankWrites: async () => {},
+    mentalModel: async () => ({}), deleteBank: async () => { throw new Error('offline'); },
+    initializeBank: async () => {},
+  });
+  const context = new ContextSystem({ dataRoot: root, bridge });
+  await assert.rejects(context.clearMemory(), /offline/);
+  assert.equal(context.state().resetPending, true);
+  await context.dispose();
+  // A leftover file can still exist if the process stopped partway through the disk writes.
+  await writeFile(join(root, 'hindsight-outbox.jsonl'), JSON.stringify({ type: 'item', item: { text: 'old queue entry' } }) + '\n');
+  const restarted = new ContextSystem({ dataRoot: root, bridge });
+  t.after(() => restarted.dispose());
+  await restarted.ready;
+  assert.equal(restarted.state().outbox, 0);
+  assert.equal(restarted.state().resetPending, true);
+  assert.equal(await restarted.refreshCache(), false);
+  bridge.deleteBank = async () => {};
+  await restarted.clearMemory();
+  assert.equal(restarted.state().resetPending, false);
+  assert.equal(await readFile(join(root, 'hindsight-outbox.jsonl'), 'utf8'), '');
+});
 
 test('a labeled speaker is stored as 名字：原文 and is not marked unconfirmed', async () => {
   const root = await dir();

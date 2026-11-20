@@ -1,3 +1,4 @@
+import { timed } from '../log/index.mjs';
 import { randomBytes } from 'node:crypto';
 
 export const VOICEPRINT_LIMIT = 50;
@@ -145,7 +146,10 @@ export class VoiceprintDirectory {
   constructor({ apiKey, fetchImpl = globalThis.fetch, endpoint = VOICEPRINT_ENDPOINT } = {}) {
     this.apiKey = apiKey; this.fetchImpl = fetchImpl; this.endpoint = endpoint;
   }
-  async invoke(action, payload) {
+  invoke(action, payload) {
+    return timed('voice.voiceprint.request', () => this.invokeBody(action, payload), { operation: action });
+  }
+  async invokeBody(action, payload) {
     if (!this.apiKey) throw fail('请先填写 SOUND2TEXT_API_KEY', 409);
     let response, data;
     try {

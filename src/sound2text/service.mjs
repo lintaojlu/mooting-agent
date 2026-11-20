@@ -1,3 +1,4 @@
+import { createTrace, currentTrace, elapsed, errorFields, log, runWithTrace, timed, traceIds } from '../log/index.mjs';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
@@ -24,6 +25,7 @@ export class Sound2Text {
     this.events = new EventEmitter(); this.events.on('error', () => {});
     this.WebSocketImpl = WebSocketImpl; this.now = now; this.rmsThreshold = rmsThreshold;
     this.status = 'stopped'; this.text = ''; this.utterances = []; this.audioMs = 0; this.pending = Buffer.alloc(0); this.recentAudio = []; this.enrollmentAudio = []; this.lastVoiceMs = 0; this.capture = { status: 'idle' }; this.owner = null;
+    this.utteranceLogs = new WeakMap();
     this.loadVoiceprints = loadVoiceprints; this.voiceprintNotice = '';
     this.reloadConfig = config === undefined ? () => loadConfig(configPath) : undefined;
     this.ready = Promise.resolve(config ?? loadConfig(configPath)).then(value => { this.config = { endWindowMs: 800, silenceMs: 1500, noSpeechMs: 10000, maxCommandMs: 60000, finalWaitMs: 3000, url: DEFAULT_URL, ...value }; return this; });
@@ -32,11 +34,15 @@ export class Sound2Text {
   changed() { this.events.emit('change', this.state()); }
   subscribe(listener) { this.events.on('change', listener); return () => this.events.off('change', listener); }
   fail(error) {
+    log('error', 'voice.asr.error', errorFields(error), this.captureLog?.trace ?? this.streamTrace);
     const message = error instanceof Error ? error.message : String(error);
     this.error = message; this.status = 'error'; this.cancelCapture('识别连接异常，指令已中止'); this.pending = Buffer.alloc(0);
     this.events.emit('error', { error: message }); this.changed(); this.initialReject?.(new Error(message)); this.owner = null; this.socket?.terminate();
   }
-  async start(owner) {
+  start(owner) {
+    return timed('voice.asr.connect', () => this.startBody(owner));
+  }
+  async startBody(owner) {
     await this.ready;
     if (this.owner && owner && this.owner !== owner) throw new Error('语音输入已由其他页面占用');
     if (this.status === 'running') return this.state();
@@ -52,6 +58,7 @@ export class Sound2Text {
         voiceprints = Array.isArray(loaded) ? loaded : [];
       } catch { this.voiceprintNotice = '这次没有声纹匹配'; voiceprints = []; }
     }
+    this.streamTrace = currentTrace();
     this.owner = owner ?? this.owner; this.error = undefined; this.status = 'connecting'; this.text = ''; this.utterances = []; this.audioMs = 0; this.pending = Buffer.alloc(0); this.recentAudio = []; this.enrollmentAudio = []; this.lastVoiceMs = 0; this.sequence = 1; this.changed();
     const socket = this.socket = new this.WebSocketImpl(this.config.url, { headers: { 'X-Api-Key': this.config.apiKey, 'X-Api-Resource-Id': this.config.resourceId, 'X-Api-Request-Id': randomUUID() }, maxPayload: 2 * 1024 * 1024, handshakeTimeout: 10000 });
     socket.on('message', (data, binary) => { if (this.socket !== socket) return; try { if (!binary) throw new Error('ASR 返回非二进制消息'); const packet = decodeResponse(data); if (packet.code) throw new Error(`ASR 服务错误 ${packet.code}`); if (packet.data?.code && packet.data.code !== 20000000 && packet.data.code !== 1000) throw new Error(`ASR 服务错误 ${packet.data.code}`); this.initialResolve?.(); this.handleResult(packet.data); if (packet.terminal) { this.terminalResolve?.(); if (this.status === 'running') this.fail(new Error('ASR 流已结束，请重新开启语音输入')); } } catch (error) { this.fail(error); } });
@@ -120,7 +127,7 @@ export class Sound2Text {
     const last = Math.min(buffer.length / 2, Math.floor((endMs - startMs) * 16));
     if (last <= first) return;
     let power = 0; for (let i = first; i < last; i++) { const sample = buffer.readInt16LE(i * 2) / 32768; power += sample * sample; }
-    if (Math.sqrt(power / (last - first)) >= this.rmsThreshold) { this.capture.heardSpeech = true; this.capture.lastVoiceMs = startMs + last / 16; }
+    if (Math.sqrt(power / (last - first)) >= this.rmsThreshold) { this.markCaptureSpeech(); this.capture.heardSpeech = true; this.capture.lastVoiceMs = startMs + last / 16; }
   }
   handleResult(data) {
     const result = data?.result; if (!result) return;
@@ -137,6 +144,18 @@ export class Sound2Text {
       // ASR may adjust start times when revising or finalizing a segment. A final
       // segment supersedes overlapping drafts; late drafts cannot undo a final.
       if (!normalized.definite && this.utterances.some(entry => entry.definite && overlaps(entry))) continue;
+      const existing = this.utterances.find(entry => entry.start_time === start) ?? this.utterances.find(entry => !entry.definite && overlaps(entry));
+      const previous = this.utteranceLogs.get(existing);
+      const trace = previous?.trace ?? createTrace('voice_segment', traceIds(this.streamTrace));
+      const observed = previous ?? { trace, detectedAt: performance.now() };
+      if (!previous) log('debug', 'voice.asr.speech_detected', {}, trace);
+      if (normalized.definite && observed.finalAt === undefined) {
+        observed.finalAt = performance.now();
+        log('info', 'voice.asr.segment_finalized', {
+          elapsedMs: elapsed(observed.detectedAt), durationMs: end - start,
+        }, trace);
+      }
+      this.utteranceLogs.set(normalized, observed);
       this.utterances = this.utterances.filter(entry => entry.start_time !== normalized.start_time && (entry.definite || !overlaps(entry)));
       this.utterances.push(normalized);
     }
@@ -146,20 +165,35 @@ export class Sound2Text {
       const hit = this.utterances.find(u => u.end_time > this.capture.boundaryMs);
       if (hit) this.noteSpeech(hit.start_time, hit.end_time);
     }
-    this.events.emit('text', { text: this.text, utterances: structuredClone(this.utterances), audioMs: this.audioMs }); this.tryFinalize(); this.changed();
+    runWithTrace(this.captureLog?.trace ?? this.streamTrace, () => {
+      this.events.emit('text', { text: this.text, utterances: structuredClone(this.utterances), audioMs: this.audioMs });
+    });
+    this.tryFinalize(); this.changed();
+  }
+  utteranceTiming(utterance) {
+    const item = this.utterances.find(entry => entry.start_time === utterance?.start_time);
+    return this.utteranceLogs.get(item);
   }
   armCapture(boundaryMs) {
     if (this.status !== 'running') throw new Error('请先开启语音输入');
     if (this.capture.status !== 'idle') throw new Error('已经在采集指令');
     const boundary = this.checkpoint(boundaryMs);
+    this.captureLog = { trace: createTrace('voice', traceIds(this.streamTrace)) };
+    log('debug', 'voice.capture.armed', {}, this.captureLog.trace);
     this.capture = { status: 'listening', id: randomUUID(), boundaryMs: boundary, heardSpeech: false, lastVoiceMs: boundary };
     for (const frame of this.recentAudio) this.observeVoice(frame.buffer, frame.startMs, boundary, this.audioMs);
-    this.noSpeechTimer = setTimeout(() => { if (this.capture.status === 'listening' && !this.capture.heardSpeech) this.cancelCapture('等待语音超时，未提交指令'); }, this.config.noSpeechMs);
+    this.noSpeechTimer = setTimeout(() => { if (this.capture.status === 'listening' && !this.capture.heardSpeech) this.cancelCapture('等待语音超时，未提交指令', 'timeout'); }, this.config.noSpeechMs);
     this.maxTimer = setTimeout(() => { if (this.capture.status === 'listening') this.finishCapture('max_duration'); }, this.config.maxCommandMs);
     this.events.emit('capture', { ...this.capture }); this.changed(); return { ...this.capture };
   }
+  markCaptureSpeech() {
+    if (!this.captureLog || this.capture.heardSpeech) return;
+    this.captureLog.trace.started = performance.now();
+    log('info', 'voice.capture.speech_detected', {}, this.captureLog.trace);
+  }
   noteSpeech(startMs, endMs) {
     if (this.capture.status !== 'listening' || endMs <= this.capture.boundaryMs) return;
+    this.markCaptureSpeech();
     this.capture.heardSpeech = true;
     this.capture.lastVoiceMs = Math.max(this.capture.lastVoiceMs, endMs);
     this.changed();
@@ -170,6 +204,10 @@ export class Sound2Text {
     if (cutoffMs < this.capture.boundaryMs) throw new Error('指令结束边界早于开始边界');
     clearTimeout(this.noSpeechTimer); clearTimeout(this.maxTimer);
     if (!this.capture.heardSpeech && cutoffMs <= this.audioMs) { this.cancelCapture('没有有效语音，未提交指令'); return { ...this.capture }; }
+    if (this.captureLog) {
+      this.captureLog.finalizingAt = performance.now();
+      log('debug', 'voice.capture.finishing', { reason, timeoutMs: this.config.finalWaitMs }, this.captureLog.trace);
+    }
     this.capture = { ...this.capture, status: 'finishing', endMs: this.capture.lastVoiceMs, cutoffMs, reason };
     this.events.emit('capture', { ...this.capture }); this.changed();
     const lag = Math.max(0, cutoffMs - this.audioMs);
@@ -201,26 +239,40 @@ export class Sound2Text {
     const capture = this.capture;
     clearTimeout(this.finalTimer);
     this.capture = { status: 'idle', id: capture.id, boundaryMs: capture.boundaryMs, reason: capture.reason, text: result.text };
-    this.events.emit('capture', { ...this.capture }); this.changed(); this.events.emit('instruction', { text: result.text, id: capture.id, reason: capture.reason });
+    const timing = this.captureLog;
+    this.captureLog = undefined;
+    runWithTrace(timing?.trace, () => {
+      log('info', 'voice.capture.finalized', {
+        elapsedMs: timing?.finalizingAt !== undefined ? elapsed(timing.finalizingAt) : undefined, outcome: 'ok',
+      });
+      this.events.emit('capture', { ...this.capture }); this.changed();
+      this.events.emit('instruction', { text: result.text, id: capture.id, reason: capture.reason });
+    });
   }
   expireCapture() {
     if (this.capture.status !== 'finishing') return;
     const result = this.commandText(this.capture, { allowGap: true });
-    if (result.wait) this.cancelCapture('识别未完成，请重试');
+    if (result.wait) this.cancelCapture('识别未完成，请重试', 'timeout');
     else this.settle(result);
   }
   tryFinalize() {
     if (this.capture.status !== 'finishing') return;
     this.settle(this.commandText(this.capture));
   }
-  cancelCapture(reason = 'cancelled') {
+  cancelCapture(reason = 'cancelled', outcome = 'cancelled') {
+    const timing = this.captureLog;
+    this.captureLog = undefined;
+    if (timing) log('warning', 'voice.capture.end', {
+      outcome, totalMs: elapsed(timing.trace.started),
+      elapsedMs: timing.finalizingAt !== undefined ? elapsed(timing.finalizingAt) : undefined,
+    }, timing.trace);
     clearTimeout(this.noSpeechTimer); clearTimeout(this.maxTimer); clearTimeout(this.finalTimer);
     if (this.capture.status !== 'idle') { this.capture = { status: 'idle', id: this.capture.id, boundaryMs: this.capture.boundaryMs, reason, error: reason }; this.events.emit('capture', { ...this.capture }); this.changed(); }
     return { ...this.capture };
   }
   pause(reason = 'paused') {
     if (this.pausing) return this.pausing;
-    this.pausing = this.stop(reason).finally(() => { this.pausing = undefined; });
+    this.pausing = timed('voice.asr.stop', () => this.stop(reason), { reason }, { trace: this.streamTrace }).finally(() => { this.pausing = undefined; });
     return this.pausing;
   }
   async stop(reason) {

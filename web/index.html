@@ -18,6 +18,18 @@
 <body>
   <main class="workspace">
     <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+    <dialog id="instruction-dialog" class="instruction-dialog" aria-labelledby="instruction-title">
+      <header class="settings-header"><h2 id="instruction-title">发送指令</h2></header>
+      <form id="instruction-form" class="settings-body" novalidate>
+        <label for="instruction-input">指令</label>
+        <textarea id="instruction-input" name="instruction" rows="4" maxlength="4000" aria-describedby="instruction-feedback" required autofocus></textarea>
+        <p id="instruction-feedback" class="instruction-feedback" role="alert"></p>
+        <div class="submit-row instruction-actions">
+          <button id="cancel-instruction" type="button">取消</button>
+          <button id="send-instruction" class="primary-button" type="submit">发送</button>
+        </div>
+      </form>
+    </dialog>
     <dialog id="model-settings" class="settings-dialog" aria-labelledby="settings-title">
       <header class="settings-header"><h2 id="settings-title">设置</h2><button id="close-settings" class="text-button" type="button" aria-label="关闭设置">关闭</button></header>
       <nav class="settings-nav" aria-label="设置分类">
@@ -25,6 +37,7 @@
         <button type="button" data-settings-panel="embedding">Embedding</button>
         <button type="button" data-settings-panel="volcano">火山</button>
         <button type="button" data-settings-panel="voiceprint">声纹</button>
+        <button type="button" data-settings-panel="memory">记忆管理</button>
       </nav>
       <section id="settings-llm">
         <div class="settings-section-title"><h3>LLM</h3><span id="config-status" class="muted">未配置</span></div>
@@ -90,11 +103,30 @@
           </form>
         </div>
       </section>
+      <section id="settings-memory" hidden>
+        <div class="settings-section-title"><h3>记忆管理</h3></div>
+        <div class="settings-body memory-settings-body">
+          <p>清空共享的长期记忆、最近原话、本地记忆和 Context System Trace，以及所有账号的 Agent 对话和 Agent Trace。</p>
+          <button id="open-memory-clear" class="danger-button" type="button" aria-haspopup="dialog" disabled>清空记忆和 Agent 对话</button>
+          <p id="memory-clear-status" class="settings-feedback" role="status"></p>
+        </div>
+      </section>
+    </dialog>
+    <dialog id="memory-clear-dialog" class="memory-clear-dialog" aria-labelledby="memory-clear-title" aria-describedby="memory-clear-description">
+      <header class="settings-header"><h2 id="memory-clear-title">清空记忆和 Agent 对话？</h2></header>
+      <form id="memory-clear-form" class="settings-body">
+        <p id="memory-clear-description">共享记忆以及所有账号的 Agent 对话和轨迹都会被删除。此操作无法撤销。</p>
+        <p id="memory-clear-error" class="settings-feedback error" role="alert"></p>
+        <div class="diagnostic-actions instruction-actions">
+          <button id="cancel-memory-clear" type="button" autofocus>取消</button>
+          <button id="confirm-memory-clear" class="danger-button" type="submit">确认清空</button>
+        </div>
+      </form>
     </dialog>
     <div class="lab-grid">
       <section class="panel output-panel" aria-label="输出"><div class="screen"><div class="panel-heading output-status system-bar"><time id="output-date" class="output-date">--/-- 周-</time><span class="system-right"><time id="output-title" class="output-clock">--:--</time><span class="output-battery" title="电量（模拟）"><svg class="battery-icon" viewBox="0 0 36 18" aria-hidden="true" focusable="false"><rect x="0.75" y="0.75" width="30.5" height="16.5" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M32.2 5.2h1.7a1.2 1.2 0 0 1 1.2 1.2v5a1.2 1.2 0 0 1-1.2 1.2h-1.7z" fill="currentColor"/><rect class="battery-bar" x="3" y="3.1" width="5.4" height="11.8" rx="0.6" fill="currentColor"/><rect class="battery-bar" x="9.8" y="3.1" width="5.4" height="11.8" rx="0.6" fill="currentColor"/><rect class="battery-bar" x="16.6" y="3.1" width="5.4" height="11.8" rx="0.6" fill="currentColor"/><rect class="battery-bar" x="23.4" y="3.1" width="5.4" height="11.8" rx="0.6" fill="currentColor"/></svg></span></span></div><div id="output-stage" class="output-stage"><div class="content-row"><div id="main-column" class="main-column"><div id="agent-panel" class="agent-panel" aria-label="agent panel" aria-hidden="true"><p id="agent-pending" class="agent-pending" hidden><span class="agent-pending-mark" aria-hidden="true">••</span><span id="agent-pending-text"></span></p><div id="interaction-window" class="interaction-window" aria-live="polite"><p class="agent-label">Agent</p><div id="output-text" class="output-text"></div></div></div><div id="main-panel" class="main-panel" aria-label="main panel"><div id="main-text" class="output-text main-text"></div></div></div><div id="function-panel" class="function-panel" aria-label="function panel" aria-hidden="true"><div id="function-window" class="interaction-window" aria-live="polite"><section id="speaker-card" class="speaker-card" aria-labelledby="speaker-card-title" hidden><h3 id="speaker-card-title">社交卡片</h3><div class="speaker-field" data-field="name"><span class="speaker-label">名字</span><p id="speaker-name" class="speaker-name">—</p><input id="speaker-name-input" class="speaker-input" type="text" maxlength="32" hidden></div><div class="speaker-field" data-field="position"><span class="speaker-label">职位</span><p id="speaker-position" class="speaker-role">—</p><input id="speaker-position-input" class="speaker-input" type="text" maxlength="200" hidden></div><div class="speaker-field" data-field="company"><span class="speaker-label">公司</span><p id="speaker-company" class="speaker-role">—</p><input id="speaker-company-input" class="speaker-input" type="text" maxlength="200" hidden></div><div class="speaker-field" data-field="school"><span class="speaker-label">毕业院校</span><p id="speaker-school" class="speaker-role">—</p><input id="speaker-school-input" class="speaker-input" type="text" maxlength="200" hidden></div><div class="speaker-field" data-field="mbti"><span class="speaker-label">MBTI</span><p id="speaker-mbti" class="speaker-role">—</p><input id="speaker-mbti-input" class="speaker-input" type="text" maxlength="16" placeholder="例如 INTJ" hidden></div><div class="speaker-field" data-field="topic"><span class="speaker-label">上次话题</span><p id="speaker-topic" class="speaker-role">—</p><textarea id="speaker-topic-input" class="speaker-input" rows="3" maxlength="200" hidden></textarea></div><div class="speaker-field" data-field="savedAt"><span class="speaker-label">保存时间</span><p id="speaker-saved" class="speaker-role">—</p></div><div class="speaker-notes-block"><p class="speaker-notes-label">信息</p><div id="speaker-notes">—</div></div><p id="speaker-error" class="speaker-error" role="alert" hidden></p></section></div></div></div></div><footer class="guide-panel" aria-label="guide panel"><span class="guide-key">头部</span><span class="guide-hint">左歪关闭 · 右歪展开</span></footer></div></section>
       <div class="side-stack">
-        <section class="panel control-panel" aria-labelledby="input-title"><div class="panel-heading control-heading"><h1 id="input-title">控制面板</h1><button id="audio-toggle" class="audio-toggle" type="button" aria-label="开启语音输入" aria-pressed="false" title="开启语音输入"><svg class="play-symbol" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8 5.5 18 12 8 18.5Z" fill="currentColor"/></svg><svg class="pause-symbol" viewBox="0 0 24 24" aria-hidden="true" focusable="false" hidden><path d="M7 5h3v14H7zm7 0h3v14h-3z" fill="currentColor"/></svg></button></div><div class="panel-body control-actions"><form id="submit-form" novalidate><button id="submit-button" class="primary-button" type="submit" aria-label="右键" disabled>右键</button></form><button id="open-agent" class="esc-button" type="button" aria-label="打开 agent 面板" aria-pressed="false" disabled>打开 agent 面板</button><button id="open-function" class="esc-button" type="button" aria-label="打开功能面板" aria-pressed="false" disabled>打开功能面板</button><button id="save-social-card" class="primary-button" type="button" aria-label="保存社交信息" disabled>保存社交信息</button><button id="discard-social-card" class="esc-button" type="button" aria-label="不保存社交信息" disabled>不保存社交信息</button></div></section>
+        <section class="panel control-panel" aria-labelledby="input-title"><div class="panel-heading control-heading"><h1 id="input-title">控制面板</h1><button id="audio-toggle" class="audio-toggle" type="button" aria-label="开启语音输入" aria-pressed="false" title="开启语音输入"><svg class="play-symbol" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8 5.5 18 12 8 18.5Z" fill="currentColor"/></svg><svg class="pause-symbol" viewBox="0 0 24 24" aria-hidden="true" focusable="false" hidden><path d="M7 5h3v14H7zm7 0h3v14h-3z" fill="currentColor"/></svg></button></div><div class="panel-body control-actions"><form id="submit-form" novalidate><button id="submit-button" class="primary-button" type="submit" aria-label="右键" disabled>右键</button></form><button id="open-instruction" class="primary-button" type="button" aria-haspopup="dialog">发送指令</button><button id="open-agent" class="esc-button" type="button" aria-label="打开 agent 面板" aria-pressed="false" disabled>打开 agent 面板</button><button id="open-function" class="esc-button" type="button" aria-label="打开功能面板" aria-pressed="false" disabled>打开功能面板</button><button id="save-social-card" class="primary-button" type="button" aria-label="保存社交信息" disabled>保存社交信息</button><button id="discard-social-card" class="esc-button" type="button" aria-label="不保存社交信息" disabled>不保存社交信息</button></div></section>
         <section class="panel stream-panel" aria-labelledby="inform-stream-title"><div class="panel-heading"><h2 id="inform-stream-title">信息流</h2></div><div class="inform-stream"><textarea id="inform_stream" rows="2" readonly placeholder="语音识别会显示在这里" aria-labelledby="inform-stream-title"></textarea></div></section>
       </div>
     </div>
@@ -103,7 +135,11 @@
     </div>
     <div class="detail-grid">
       <section class="panel context-trace-panel" aria-labelledby="context-trace-title"><div class="panel-heading"><h2 id="context-trace-title">Context System Trace</h2><span id="context-trace-count" class="count">0</span></div><div id="context-trace-view" class="context-trace-view" role="region" aria-label="Context System 执行轨迹" tabindex="0"><table><thead><tr><th scope="col">时间</th><th scope="col">阶段</th><th scope="col">执行详情</th></tr></thead><tbody id="context-trace-rows"></tbody></table></div></section>
-      <section class="panel trace-panel" aria-labelledby="trace-title"><div class="panel-heading"><h2 id="trace-title">Agent Trace</h2><span id="trace-count" class="count">0</span></div><p id="views-error" class="view-error" role="alert" hidden></p><div id="trajectory-view" class="dsh-view"></div><details class="raw-events"><summary>原始事件与任务数据</summary><pre id="raw-events">[]</pre></details></section>
+      <section class="panel trace-panel" aria-labelledby="trace-title"><div class="panel-heading"><h2 id="trace-title">Agent Trace</h2><span id="trace-count" class="count">0</span></div>
+        <div id="trace-lookup" class="trace-lookup" hidden>
+          <label for="trace-id">Trace ID</label><input id="trace-id" type="text" readonly spellcheck="false">
+          <button id="copy-trace-id" type="button">复制</button><span id="trace-copy-status" role="status"></span>
+        </div><p id="views-error" class="view-error" role="alert" hidden></p><div id="trajectory-view" class="dsh-view"></div><details class="raw-events"><summary>原始事件与任务数据</summary><pre id="raw-events">[]</pre></details></section>
     </div>
   </main>
   <button id="open-settings" class="settings-launcher" type="button" aria-label="设置" title="设置"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" d="M12 15.2a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4Z"/><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" d="M19.4 13.2a7.8 7.8 0 0 0 .06-1.2 7.8 7.8 0 0 0-.06-1.2l1.9-1.5-1.9-3.3-2.3.9a7.7 7.7 0 0 0-2.1-1.2L14.6 3h-5.2l-.4 2.7a7.7 7.7 0 0 0-2.1 1.2l-2.3-.9-1.9 3.3 1.9 1.5a7.8 7.8 0 0 0 0 2.4l-1.9 1.5 1.9 3.3 2.3-.9a7.7 7.7 0 0 0 2.1 1.2l.4 2.7h5.2l.4-2.7a7.7 7.7 0 0 0 2.1-1.2l2.3.9 1.9-3.3-1.9-1.5Z"/></svg></button>

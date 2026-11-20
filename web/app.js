@@ -170,6 +170,7 @@
   }
   function contextTraceSummary(entry) {
     const labels = { 'memory.read': '读取并注入 Router', 'outbox.read': '读取待写批次', 'retain.request': '写入 Hindsight 请求', 'speech.final': '语音定稿', 'speech.paused': '语音暂停', 'turn.queued': '回合入队', 'router.busy': 'Router 执行中', 'router.idle': 'Router 空闲', 'flush.start': '开始写入', 'flush.deferred': '等待 Router 空闲', 'flush.offline': '记忆服务离线', 'flush.sealed': '封装批次', 'flush.end': '写入结束', 'flush.failed': '写入失败', 'flush.retry': '安排重试', 'retain.submitted': '提交 Hindsight', 'retain.check': '检查写入状态', 'retain.status': '写入状态', 'retain.completed': '写入完成', 'cache.refresh.start': '开始刷新缓存', 'cache.model': '模型缓存更新', 'cache.model.failed': '模型缓存失败', 'cache.refresh.end': '缓存刷新完成', 'hindsight.status': '记忆服务状态', 'memory.search.start': '开始检索', 'memory.search.end': '检索完成', 'memory.search.failed': '检索失败', 'memory.search.unavailable': '检索不可用', 'memory.reflect.start': '开始回想', 'memory.reflect.end': '回想完成', 'memory.reflect.failed': '回想失败', 'memory.reflect.unavailable': '回想不可用' };
+    labels['memory.clear'] = '清空本地记忆';
     const data = entry?.data ?? {};
     const content = entry?.type === 'memory.read' ? data.injected : data.content ?? data.text ?? data.answer;
     const preview = typeof content === 'string' ? content.replace(/\s+/g, ' ').trim().slice(0, 180) : '';
@@ -236,6 +237,7 @@
     const speakerActive = !!state?.speaker?.active, voice = audioState(state, localAudioStatus);
     const draft = !!state?.speaker?.draft;
     const dictateBusy = dictating && voice.capturing === 'finishing';
+    $('open-memory-clear').disabled = !connected || memoryClearing || !!state?.context?.clearing;
     $('submit-button').disabled = !connected || dictateBusy || !configured || !voice.running || voice.busyAudio || voice.capturing === 'finishing';
     $('submit-button').setAttribute('aria-label', '右键');
     const agentLabel = agentOpen ? '关闭 agent 面板' : '打开 agent 面板';
@@ -249,6 +251,7 @@
     $('open-function').textContent = functionLabel;
     $('open-function').setAttribute('aria-label', functionLabel);
     $('open-function').setAttribute('aria-pressed', String(functionOpen));
+    $('open-function').title = draft ? '请先保存或不保存这张社交卡片' : functionLabel;
     $('save-model').disabled = saving || !!state?.busy;
     $('audio-toggle').disabled = !connected || localAudioStatus === 'stopping' || !audio;
     $('audio-toggle').setAttribute('aria-pressed', String(voice.active));
@@ -313,6 +316,7 @@
     schedule();
   }
   let contextTraceEntries = new Map();
+  let contextTraceClearedThrough = 0;
   function traceRow(entry) {
     const record = contextTraceSummary(entry);
     const row = document.createElement('tr'); row.dataset.seq = String(entry.seq);
@@ -337,10 +341,15 @@
     row.append(when, stage, detail);
     return row;
   }
-  function renderContextTrace(entries) {
+  function renderContextTrace(entries, clearedThrough = 0) {
     const rows = $('context-trace-rows');
+    if (clearedThrough > contextTraceClearedThrough) {
+      contextTraceClearedThrough = clearedThrough;
+      contextTraceEntries.clear();
+      rows.replaceChildren();
+    }
     if (!Array.isArray(entries) || !entries.length) return;
-    const unseen = entries.filter(entry => Number.isInteger(entry?.seq) && !contextTraceEntries.has(entry.seq));
+    const unseen = entries.filter(entry => Number.isInteger(entry?.seq) && entry.seq > contextTraceClearedThrough && !contextTraceEntries.has(entry.seq));
     if (!unseen.length) return;
     for (const entry of unseen) contextTraceEntries.set(entry.seq, entry);
     const ordered = [...contextTraceEntries.values()].sort((left, right) => left.seq - right.seq);
@@ -461,7 +470,16 @@
     followScrollports();
   }
   function applyState(value) {
-    state = validateState(value); displayConfig(state.modelConfig, !configLoaded);
+    const next = validateState(value);
+    if (state?.traceRun && state.traceRun !== next.traceRun) {
+      agentOpen = false;
+      agentPhase = 'idle';
+      resetStream();
+      $('output-text').replaceChildren();
+      root.MootingDSHViews?.dispose?.($('trajectory-view'));
+    }
+    state = next;
+    displayConfig(state.modelConfig, !configLoaded);
     const memory = contextPanel(state);
     $('context-snapshot').textContent = memory.text;
     $('context-injected').textContent = memory.injected;
@@ -470,8 +488,10 @@
     $('context-memory-info').textContent = memory.info;
     $('context-memory-info').hidden = !memory.info;
     renderServiceSettings(state);
-    renderContextTrace(state.context.trace);
+    renderContextTrace(state.context.trace, state.context.traceClearedThrough);
     $('context-trace-count').textContent = String(Math.max(state.context.traceCount ?? 0, contextTraceEntries.size));
+    if (state.context.resetPending && !state.context.clearing) $('memory-clear-status').textContent = '上次清空未完成，请重试。';
+    else if (!memoryClearing && $('memory-clear-status').textContent === '上次清空未完成，请重试。') $('memory-clear-status').textContent = '';
     const speakerActive = !!state.speaker?.active;
     const fn = functionPanel(state);
     $('output-stage').classList.toggle('is-function', !!fn.kind);
@@ -486,6 +506,12 @@
     if (speakerActive) $('function-window').scrollTop = 0;
     renderSpeakerNotes(person?.notes);
     const feedback = captureFeedback(state);
+    const traceId = state.traceId || '';
+    if ($('trace-id').value !== traceId) {
+      $('trace-id').value = traceId;
+      $('trace-copy-status').textContent = '';
+    }
+    $('trace-lookup').hidden = !traceId;
     $('trace-count').textContent = String(state.events.length);
     $('raw-events').textContent = JSON.stringify({ events: state.events, tasks: state.tasks, trace: state.trace }, null, 2);
     if (feedback?.error) {
@@ -544,7 +570,11 @@
   async function request(path, body) {
     const response = await fetch(api(path), { method: body === undefined ? 'GET' : 'POST', headers: { 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     if (response.status === 401) { location.assign(api('/login')); throw new Error('请先登录'); }
-    if (!response.ok) { let message; try { message = (await response.json()).error; } catch {} throw new Error(message || '请求失败（HTTP ' + response.status + '）'); }
+    if (!response.ok) {
+      let message;
+      try { message = (await response.json()).error; } catch {}
+      throw Object.assign(new Error(message || '请求失败（HTTP ' + response.status + '）'), { status: response.status });
+    }
     return response.json();
   }
   async function connect() {
@@ -587,12 +617,60 @@
     settingText('volcano-resource', value.sound2text?.resourceId);
     settingText('volcano-endpoint', value.sound2text?.endpoint);
   }
+  $('copy-trace-id').addEventListener('click', async () => {
+    const field = $('trace-id'), id = field.value;
+    if (!id) return;
+    try {
+      await navigator.clipboard.writeText(id);
+      if (field.value === id) $('trace-copy-status').textContent = '已复制';
+    } catch {
+      field.focus();
+      field.select();
+      $('trace-copy-status').textContent = '已选中，可手动复制';
+    }
+  });
   $('open-settings').addEventListener('click', () => showSettings('llm'));
   document.querySelector('.settings-nav').addEventListener('click', event => {
     const button = event.target.closest('[data-settings-panel]');
     if (button) showSettings(button.dataset.settingsPanel);
   });
   $('close-settings').addEventListener('click', () => $('model-settings').close());
+  let memoryClearing = false;
+  const memoryClearDialog = $('memory-clear-dialog');
+  $('open-memory-clear').addEventListener('click', () => {
+    $('memory-clear-error').textContent = '';
+    memoryClearDialog.showModal();
+  });
+  $('cancel-memory-clear').addEventListener('click', () => memoryClearDialog.close());
+  memoryClearDialog.addEventListener('cancel', event => { if (memoryClearing) event.preventDefault(); });
+  $('memory-clear-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    if (memoryClearing) return;
+    memoryClearing = true;
+    const confirm = $('confirm-memory-clear');
+    const cancel = $('cancel-memory-clear');
+    const feedback = $('memory-clear-error');
+    confirm.disabled = cancel.disabled = true;
+    confirm.textContent = '正在清空…';
+    feedback.textContent = '';
+    $('memory-clear-status').textContent = '';
+    controls();
+    try {
+      const result = await request('/api/memory/clear', { confirm: true });
+      $('memory-clear-status').textContent = result.longTermCleared
+        ? '所有记忆和 Agent 对话已清空。'
+        : '本地记忆和 Agent 对话已清空。长期记忆服务未启用或未配置。';
+      memoryClearDialog.close();
+    } catch (error) { feedback.textContent = error.message; }
+    finally {
+      memoryClearing = false;
+      confirm.disabled = cancel.disabled = false;
+      confirm.textContent = '确认清空';
+      controls();
+      if (memoryClearDialog.open) confirm.focus();
+      else $('open-memory-clear').focus();
+    }
+  });
   $('model-form').addEventListener('input', () => { formDirty = true; });
   $('owner-speaker-form').addEventListener('submit', async event => {
     event.preventDefault();
@@ -635,6 +713,45 @@
     event.preventDefault(); if ($('submit-button').disabled) return;
     confirmChain = confirmChain.then(sendConfirm, sendConfirm);
   });
+  const instructionDialog = $('instruction-dialog');
+  const instructionInput = $('instruction-input');
+  const instructionFeedback = $('instruction-feedback');
+  const instructionSend = $('send-instruction');
+  const instructionCancel = $('cancel-instruction');
+  $('open-instruction').addEventListener('click', () => {
+    instructionFeedback.textContent = '';
+    instructionDialog.showModal();
+  });
+  instructionInput.addEventListener('input', () => { instructionFeedback.textContent = ''; });
+  instructionCancel.addEventListener('click', () => instructionDialog.close());
+  instructionDialog.addEventListener('cancel', event => {
+    if (instructionSend.disabled) event.preventDefault();
+  });
+  $('instruction-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    if (instructionSend.disabled) return;
+    try {
+      const body = submission(instructionInput.value);
+      instructionFeedback.textContent = '';
+      instructionInput.readOnly = instructionCancel.disabled = instructionSend.disabled = true;
+      instructionSend.textContent = '发送中…';
+      await request('/api/submit', body);
+    } catch (error) {
+      instructionFeedback.textContent = error.message;
+      instructionInput.focus();
+      return;
+    } finally {
+      instructionInput.readOnly = instructionCancel.disabled = instructionSend.disabled = false;
+      instructionSend.textContent = '发送';
+    }
+    instructionInput.value = '';
+    instructionDialog.close();
+    agentOpen = true;
+    agentPhase = state?.busy ? 'live' : 'idle';
+    renderAgent();
+    controls();
+    notice('指令已发送');
+  });
   $('open-agent').addEventListener('click', () => {
     if ($('open-agent').disabled) return;
     agentOpen = !agentOpen;
@@ -653,35 +770,45 @@
   });
   async function closeFunction() {
     if ($('open-function').disabled || !state?.speaker?.active) return;
+    const cardId = state.speaker.id;
     try {
       closing = true; controls(); notice('');
-      await request('/api/interaction', {});
+      await request('/api/interaction', { cardId });
       applyState(await request('/api/state'));
-    } catch (error) { notice(error.message, true); }
+    } catch (error) { await refreshCardAfterConflict(error, cardId); }
     finally { closing = false; controls(); }
   }
   async function decideSocialCard(save) {
-    if ($('save-social-card').disabled && $('discard-social-card').disabled) return;
+    if ($(save ? 'save-social-card' : 'discard-social-card').disabled) return;
+    const cardId = state.speaker.id;
     try {
       closing = true; controls(); notice('');
       const body = save ? {
+        cardId,
         name: $('speaker-name-input').value,
         position: $('speaker-position-input').value,
         company: $('speaker-company-input').value,
         school: $('speaker-school-input').value,
         mbti: $('speaker-mbti-input').value,
         topic: $('speaker-topic-input').value,
-      } : {};
+      } : { cardId };
       await request(save ? '/api/social-card/save' : '/api/social-card/discard', body);
       applyState(await request('/api/state'));
-    } catch (error) { notice(error.message, true); }
+    } catch (error) { await refreshCardAfterConflict(error, cardId); }
     finally { closing = false; controls(); }
+  }
+  async function refreshCardAfterConflict(error, cardId) {
+    if (error.status === 409) {
+      const latest = await request('/api/state').catch(() => null);
+      if (latest && latest.speaker?.id !== cardId) applyState(latest);
+    }
+    notice(error.message, true);
   }
   $('save-social-card').addEventListener('click', () => { decideSocialCard(true); });
   $('discard-social-card').addEventListener('click', () => { decideSocialCard(false); });
   for (const id of ['speaker-name-input', 'speaker-position-input', 'speaker-company-input', 'speaker-school-input', 'speaker-mbti-input', 'speaker-topic-input']) $(id).addEventListener('input', controls);
   document.addEventListener('keydown', event => {
-    if (event.key !== 'Escape' || event.repeat || $('model-settings').open) return;
+    if (event.key !== 'Escape' || event.repeat || document.querySelector('dialog[open]')) return;
     if ($('open-function').disabled || !state?.speaker?.active) return;
     event.preventDefault();
     closeFunction();

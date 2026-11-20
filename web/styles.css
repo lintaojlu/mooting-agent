@@ -140,7 +140,15 @@ textarea[readonly] { background:#f5f5f5; color:#333333; cursor:default; }
 .settings-launcher { position:fixed; right:max(20px,env(safe-area-inset-right)); bottom:max(20px,env(safe-area-inset-bottom)); z-index:30; display:inline-flex; align-items:center; justify-content:center; width:44px; height:44px; padding:0; border:0; border-radius:50%; background:#171717; color:#ffffff; }
 .settings-launcher:hover:not(:disabled) { background:#383838; }
 .settings-launcher svg { display:block; width:22px; height:22px; }
-.settings-dialog { width:min(860px,calc(100% - 32px)); max-height:calc(100dvh - 48px); margin:auto; padding:0 0 18px; overflow:auto; border:1px solid var(--line); border-radius:7px; background:#ffffff; color:#171717; }
+.settings-dialog,.instruction-dialog,.memory-clear-dialog { max-height:calc(100dvh - 48px); margin:auto; overflow:auto; border:1px solid var(--line); border-radius:7px; background:#ffffff; color:#171717; }
+.settings-dialog { width:min(860px,calc(100% - 32px)); padding:0 0 18px; }
+.instruction-dialog,.memory-clear-dialog { width:min(480px,calc(100% - 32px)); padding:0; }
+.instruction-dialog label { display:block; margin-bottom:8px; font-size:13px; font-weight:600; }
+.instruction-dialog textarea { font-size:16px; }
+.instruction-feedback { margin-top:8px; font-size:13px; overflow-wrap:anywhere; }
+.instruction-feedback:empty { margin:0; }
+.instruction-actions { justify-content:flex-end; }
+.instruction-actions button { min-height:44px; min-width:64px; font-size:13px; }
 .settings-nav { display:flex; flex-wrap:wrap; gap:8px; padding:14px 18px 0; }
 .settings-nav button { min-height:44px; }
 .settings-nav button[aria-current="true"] { background:#171717; color:#ffffff; }
@@ -149,12 +157,19 @@ textarea[readonly] { background:#f5f5f5; color:#333333; cursor:default; }
 .settings-facts dt { color:var(--muted); font-size:12px; }
 .settings-facts dd { margin:0; overflow-wrap:anywhere; font-size:13px; }
 #settings-voiceprint .voiceprint-list { margin-bottom:18px; }
-.settings-dialog::backdrop { background:#00000066; }
+.settings-dialog::backdrop,.instruction-dialog::backdrop,.memory-clear-dialog::backdrop { background:#00000066; }
 .settings-header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:14px 18px; border-bottom:1px solid var(--line); }
 .settings-section-title { display:flex; gap:12px; align-items:center; padding:18px 18px 0; }
 .settings-section-title h3 { margin:0; font-size:14px; font-weight:600; }
 .protocol-note { padding:8px 18px 0; font-size:12px; color:var(--muted); }
 .settings-body { padding:18px; }
+.memory-settings-body p,.memory-clear-dialog p { font-size:13px; line-height:1.6; }
+.memory-settings-body > p:first-child { max-width:58ch; margin-bottom:12px; }
+.danger-button { min-height:44px; border-color:#171717; background:#171717; color:#ffffff; font-weight:600; }
+.danger-button:hover:not(:disabled) { border-color:#383838; background:#383838; }
+.settings-feedback { margin-top:8px; overflow-wrap:anywhere; }
+.settings-feedback.error { font-weight:600; }
+.settings-feedback:empty { margin:0; }
 .diagnostics { padding:14px 18px; border-top:1px solid var(--line); font-size:12px; }
 .diagnostics > summary { cursor:pointer; }
 .diagnostics .field-help { margin-top:12px; }
@@ -181,3 +196,8 @@ footer { padding-top:20px; font-size:12px; color:var(--muted); }
 .voiceprint-actions { grid-auto-flow:column; justify-content:start; align-items:center; }
 .file-button { display:inline-flex; align-items:center; height:calc(34px * 19.5 / 24); padding:0 10px; border:1px solid var(--line); border-radius:6px; background:#ffffff; font-size:11px; font-weight:600; cursor:pointer; }
 .voiceprint-form label { display:grid; gap:7px; color:var(--muted); font-size:12px; }
+
+.trace-lookup { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:8px 17px; font-size:13px; }
+.trace-lookup[hidden] { display:none; }
+.trace-lookup input { box-sizing:border-box; flex:1 1 230px; min-width:0; max-width:340px; font-family:monospace; padding:8px; }
+.trace-lookup button { min-height:44px; }

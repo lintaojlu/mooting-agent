@@ -1,4 +1,6 @@
 - insert:
+    - id: mooting-log
+      name: ./src/log/plugin.mjs
     - id: session-projection
       name: '@deepseek-ai/dsh-session-projection'
     - id: llm

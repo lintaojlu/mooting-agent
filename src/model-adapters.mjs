@@ -1,14 +1,17 @@
+import { randomUUID } from 'node:crypto';
+import { createTrace, currentTrace, elapsed, errorFields, failure, log, outcomeLevel } from './log/index.mjs';
 import { LlmAdapter, ToolCallId } from '@deepseek-ai/dsh-llm';
 import { setTimeout as delay } from 'node:timers/promises';
 
 /** Retry one transport disconnect before any response headers/output have reached the agent. */
-async function fetchResponse(endpoint, request) {
+async function fetchResponse(endpoint, request, retry) {
   for (let attempt = 0; ; attempt++) {
     try { return await fetch(endpoint, request); }
     catch (error) {
       const code = error.cause?.code ?? error.code;
       const transient = ['ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT'].includes(code);
       if (attempt >= 1 || request.signal.aborted || !transient) throw error;
+      retry(attempt + 1, error);
       await delay(200, undefined, { signal: request.signal });
     }
   }
@@ -50,24 +53,54 @@ function inputItems(messages, model, endpoint) {
 
 /** OpenAI Responses adapter only. No Chat Completions endpoint or protocol fallback. */
 export class CompatibleRouterAdapter extends LlmAdapter {
-  constructor({ endpoint, apiKey, model, thinking = true }) {
+  constructor({ endpoint, apiKey, model, thinking = true, role = 'router', trace = currentTrace }) {
     super(); const url = new URL(endpoint);
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error('Responses Base URL 必须为不带凭证和查询参数的 HTTP(S) 地址');
     this.endpoint = endpoint.replace(/\/$/, '');
     if (/\/chat\/completions$/.test(this.endpoint)) throw new Error('请使用 Responses API 的 Base URL');
     if (!this.endpoint.endsWith('/responses')) this.endpoint += '/responses';
+    this.trace = trace; this.role = role;
     this.apiKey = apiKey; this.model = model; this.thinking = thinking !== false;
   }
   async resolveModel(provider, model) { return { provider, id: model, name: model, contextWindow: 32000, defaultMaxTokens: 2048 }; }
   async *stream(options) {
+    const trace = this.trace() ?? createTrace('model'), started = performance.now();
+    const fields = { spanId: randomUUID(), role: this.role };
+    const write = (level, event, detail = {}) => log(level, `model.request.${event}`, { ...fields, ...detail, elapsedMs: elapsed(started) }, trace);
+    let outcome = 'cancelled', firstToken = false, firstText = false, usage, errorInfo;
+    write('debug', 'start');
+    try {
+      for await (const chunk of this.request(options, write)) {
+        if (!firstToken && ['text-delta', 'reasoning-delta', 'tool-call-delta'].includes(chunk.type)) {
+          firstToken = true;
+          write('info', 'first_token', { kind: chunk.type });
+        }
+        if (!firstText && chunk.type === 'text-delta') {
+          firstText = true;
+          write('info', 'first_text');
+        }
+        if (chunk.type === 'usage') usage = chunk.usage;
+        if (chunk.type === 'finish') outcome = 'ok';
+        yield chunk;
+      }
+    } catch (error) {
+      outcome = failure(error);
+      errorInfo = errorFields(error);
+      throw error;
+    } finally {
+      write(outcomeLevel(outcome), 'end', { ...usage, ...errorInfo, outcome });
+    }
+  }
+  async *request(options, write) {
     const signal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(45000)]) : AbortSignal.timeout(45000);
     signal.throwIfAborted();
     const tools = (options.tools ?? []).map(tool => ({ type: 'function', name: tool.name, description: tool.description, parameters: tool.parameters, strict: false }));
     const response = await fetchResponse(this.endpoint, {
       method: 'POST', headers: { 'Content-Type': 'application/json', ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}) },
       body: JSON.stringify({ model: this.model, input: inputItems(options.messages, this.model, this.endpoint), ...(tools.length ? { tools } : {}), stream: true, max_output_tokens: options.maxTokens ?? 2048, store: false, ...(this.thinking ? {} : { reasoning: { effort: 'none' } }), include: ['reasoning.encrypted_content'] }), signal,
-    });
-    if (!response.ok) throw new Error(`Responses 模型接口返回 HTTP ${response.status}`);
+    }, (attempt, error) => write('warning', 'retry', { attempt, delayMs: 200, ...errorFields(error) }));
+    write('debug', 'headers', { statusCode: response.status });
+    if (!response.ok) throw Object.assign(new Error(`Responses 模型接口返回 HTTP ${response.status}`), { statusCode: response.status });
     const blocks = new Map(), items = new Map(); let completed, finished = false;
     function* append(key, type, value, final = false, call) {
       if (typeof value !== 'string') throw new Error('Responses delta 必须为文本');

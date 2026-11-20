@@ -8,7 +8,7 @@
     "vendor": "node src/vendor-dsh.mjs",
     "start": "node src/start.mjs",
     "build:web": "node web/build-dsh-views.mjs",
-    "test:unit": "node --test tests/modules.test.mjs tests/capabilities-live.test.mjs tests/audio*.test.mjs tests/web.test.mjs tests/context*.test.mjs tests/hindsight-bridge.test.mjs tests/user-homes.test.mjs tests/web-tools.test.mjs",
+    "test:unit": "node --test tests/modules.test.mjs tests/capabilities-live.test.mjs tests/audio*.test.mjs tests/web.test.mjs tests/log.test.mjs tests/context*.test.mjs tests/hindsight-bridge.test.mjs tests/user-homes.test.mjs tests/web-tools.test.mjs",
     "test:memory": "node --test tests/memory-live.test.mjs",
     "test:memory:browser": "node tests/memory-panel-browser.mjs",
     "test:memory:soak": "node tests/memory-soak.mjs",

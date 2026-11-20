@@ -1,8 +1,10 @@
+import { createTrace, log, timed } from '../log/index.mjs';
 import { EventEmitter } from 'node:events';
 import { spawn } from 'node:child_process';
 import { chmod } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { HindsightServer } from '@vectorize-io/hindsight-all';
 import { HindsightClient, HindsightError, sdk } from '@vectorize-io/hindsight-client';
 import { readModelEnv } from '../model-env.mjs';
@@ -236,6 +238,7 @@ export class HindsightBridge extends EventEmitter {
   setStatus(status, error) {
     if (this.status === status && this.error === error) return;
     this.status = status; this.error = error;
+    log(error ? 'warning' : 'info', 'hindsight.status', { phase: status });
     this.emit('status', { status, error });
     if (status === 'ready') this.emit('ready');
   }
@@ -248,7 +251,9 @@ export class HindsightBridge extends EventEmitter {
   }
   /** Start (or attach to) the daemon. Never throws: failures leave the bridge offline and health polling keeps trying. */
   start() {
-    this.starting ??= this.startBody().catch(error => {
+    this.starting ??= timed('hindsight.boot', () => this.startBody(), {}, {
+      trace: createTrace('hindsight'), result: () => this.status === 'offline' ? 'unavailable' : 'ok',
+    }).catch(error => {
       if (!this.stopped) this.setStatus('offline', error.message);
     });
     return this.starting;
@@ -292,7 +297,9 @@ export class HindsightBridge extends EventEmitter {
   /** One health probe. A daemon that comes back is re-initialized before it is marked ready. */
   async probe() {
     if (this.stopped || !this.server) return this.ready;
-    const healthy = await this.server.checkHealth();
+    const healthy = await timed('hindsight.health', () => this.server.checkHealth(), {}, {
+      trace: createTrace('hindsight_health'), result: value => value ? 'ok' : 'unavailable',
+    });
     if (!healthy) { if (this.status !== 'starting') this.setStatus('offline', '记忆服务离线'); return false; }
     if (!this.ready) {
       try { await this.initializeBank(); if (!this.stopped) this.setStatus('ready'); }
@@ -315,7 +322,10 @@ export class HindsightBridge extends EventEmitter {
     }
   }
   /** Run one client call against a ready daemon with a timeout. Connection failures mark the bridge offline. */
-  async call(run, { timeoutMs = 30_000, signal } = {}) {
+  async call(operation, run, { timeoutMs = 30_000, signal } = {}) {
+    return timed('hindsight.call', () => this.callBody(run, { timeoutMs, signal }), { operation, timeoutMs });
+  }
+  async callBody(run, { timeoutMs, signal }) {
     if (!this.ready || !this.client) throw new MemoryUnavailableError(this.status === 'unconfigured' ? '记忆未配置' : this.status === 'starting' ? '记忆服务启动中' : '记忆服务离线');
     try { return await withDeadline(combined => run(this.client, combined), { timeoutMs, signal: anySignal([signal, this.lifecycle.signal]) }); }
     catch (error) {
@@ -323,17 +333,17 @@ export class HindsightBridge extends EventEmitter {
       throw error;
     }
   }
-  retain(content, options = {}, call) { return this.call((client, signal) => client.retain(this.bank, content, { ...options, signal }), call); }
-  recall(query, options = {}, call) { return this.call((client, signal) => client.recall(this.bank, query, { ...options, signal }), call); }
-  reflect(query, options = {}, call) { return this.call((client, signal) => client.reflect(this.bank, query, { ...options, signal }), call); }
-  mentalModel(id, detail = 'content', call) { return this.call((client, signal) => client.getMentalModel(this.bank, id, { detail, signal }), call); }
-  refreshMentalModel(id, call) { return this.call((client, signal) => client.refreshMentalModel(this.bank, id, { signal }), call); }
-  document(documentId, call) { return this.call((client, signal) => client.getDocument(this.bank, documentId, { signal }), call); }
-  deleteDocument(documentId, call) { return this.call((client, signal) => client.deleteDocument(this.bank, documentId, { signal }), call); }
-  listMemories(options = {}, call) { return this.call((client, signal) => client.listMemories(this.bank, { ...options, signal }), call); }
+  retain(content, options = {}, call) { return this.call('retain', (client, signal) => client.retain(this.bank, content, { ...options, signal }), call); }
+  recall(query, options = {}, call) { return this.call('recall', (client, signal) => client.recall(this.bank, query, { ...options, signal }), call); }
+  reflect(query, options = {}, call) { return this.call('reflect', (client, signal) => client.reflect(this.bank, query, { ...options, signal }), call); }
+  mentalModel(id, detail = 'content', call) { return this.call('mentalModel', (client, signal) => client.getMentalModel(this.bank, id, { detail, signal }), call); }
+  refreshMentalModel(id, call) { return this.call('refreshMentalModel', (client, signal) => client.refreshMentalModel(this.bank, id, { signal }), call); }
+  document(documentId, call) { return this.call('document', (client, signal) => client.getDocument(this.bank, documentId, { signal }), call); }
+  deleteDocument(documentId, call) { return this.call('deleteDocument', (client, signal) => client.deleteDocument(this.bank, documentId, { signal }), call); }
+  listMemories(options = {}, call) { return this.call('listMemories', (client, signal) => client.listMemories(this.bank, { ...options, signal }), call); }
   /** Exclude one world/experience fact from recall, consolidation and refresh (reversible on the Hindsight side). */
   invalidateMemory(memoryId, call) {
-    return this.call(async (client, signal) => {
+    return this.call('invalidateMemory', async (client, signal) => {
       const response = await sdk.updateMemory({ client: this.rawClient, path: { bank_id: this.bank, memory_id: memoryId }, body: { state: 'invalidated' }, signal });
       if (response.error) throw new Error(`invalidate failed: ${JSON.stringify(response.error)}`);
       return response.data;
@@ -350,20 +360,45 @@ export class HindsightBridge extends EventEmitter {
     return this.operationRequest('cancelOperation', operationId, call);
   }
   operationRequest(method, operationId, call) {
-    return this.call(async (_client, signal) => {
+    return this.call(method, async (_client, signal) => {
       const response = await sdk[method]({ client: this.rawClient, path: { bank_id: this.bank, operation_id: operationId }, signal });
       if (response.error) throw new HindsightError(`${method} failed`, response.response?.status, response.error);
       return response.data;
     }, call);
   }
   async operations(call, options = {}) {
-    return this.call(async (client, signal) => {
+    return this.call('listOperations', async (client, signal) => {
       const response = await sdk.listOperations({ client: this.rawClient, path: { bank_id: this.bank }, query: options, signal });
       if (response.error) throw new HindsightError('listOperations failed', response.response?.status, response.error);
       return response.data;
     }, call);
   }
-  deleteBank(call) { return this.call((client, signal) => client.deleteBank(this.bank, { signal }), call); }
+  deleteBank(call) { return this.call('deleteBank', (client, signal) => client.deleteBank(this.bank, { signal }), call); }
+  async waitForBankWrites() {
+    const signal = anySignal([AbortSignal.timeout(90_000), this.lifecycle.signal]);
+    try {
+      // Let running writes finish. Cancel delayed retries while they are still parked.
+      let quiet = false;
+      while (!signal.aborted) {
+        const pending = await this.operations({ signal }, { status: 'pending', exclude_parents: true });
+        for (const operation of pending.operations) {
+          if (Date.parse(operation.next_retry_at) > Date.now() + 5_000) {
+            try { await this.cancelOperation(operation.id, { signal, timeoutMs: 4_000 }); }
+            catch (error) { if (error.statusCode !== 409) throw error; }
+          }
+        }
+        const processing = await this.operations({ signal }, { status: 'processing', limit: 1, exclude_parents: true });
+        const empty = !pending.operations.length && !processing.operations.length;
+        if (empty && quiet) return;
+        quiet = empty;
+        await delay(500, undefined, { signal });
+      }
+    } catch (error) {
+      if (error.statusCode === 404) return; // A previous attempt may have already deleted the bank.
+      if (!signal.aborted) throw error;
+    }
+    throw new MemoryUnavailableError('等待记忆写入结束超时，请重试');
+  }
   /** Stop health polling and, when this process owns the daemon, stop it too. */
   async stop() {
     this.stopped = true;

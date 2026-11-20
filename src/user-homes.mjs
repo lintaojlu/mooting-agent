@@ -1,4 +1,5 @@
-import { appendFile, chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { elapsed, errorFields, log } from './log/index.mjs';
+import { appendFile, chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { InputError } from './tasks.mjs';
 
@@ -53,7 +54,7 @@ export class UserHomes {
   saveWorkspace(username, workspace) {
     if (!this.workspaces.has(username)) return;
     this.workspaces.set(username, workspace);
-    this.enqueue(username, async () => {
+    return this.enqueue(username, async () => {
       const path = join(this.directory(username), 'workspace.json');
       await writeFile(path, JSON.stringify(workspace), { mode: 0o600 });
       await chmod(path, 0o600);
@@ -61,7 +62,23 @@ export class UserHomes {
   }
   enqueue(username, job) {
     const chain = (this.chains.get(username) ?? Promise.resolve()).then(job, job);
-    this.chains.set(username, chain.catch(() => {}));
+    const queuedAt = performance.now();
+    this.chains.set(username, chain.catch(error => {
+      log('error', 'workspace.persist_failed', { ...errorFields(error), elapsedMs: elapsed(queuedAt) });
+    }));
+    return chain;
+  }
+  async clearConversations() {
+    const results = await Promise.allSettled(this.accounts.map(async username => {
+      this.logs.set(username, []);
+      const workspace = { ...this.workspace(username), lastError: null, currentContext: null, tasks: [] };
+      const removeLog = this.enqueue(username, () => rm(join(this.directory(username), 'session.jsonl'), { force: true }));
+      const saveWorkspace = this.saveWorkspace(username, workspace);
+      await saveWorkspace;
+      await removeLog;
+    }));
+    const failure = results.find(result => result.status === 'rejected');
+    if (failure) throw failure.reason;
   }
   async idle() {
     await Promise.all([...this.chains.values()]);

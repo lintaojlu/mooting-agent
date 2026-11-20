@@ -84,7 +84,7 @@ try {
   await cdp.until(`document.querySelector('#display-mode').textContent === '等待识别'`);
   asr.recognize({ text: '开启实时字幕', start: boundary + 5, end, definite: true });
   await cdp.until(`document.querySelector('#display-mode').textContent.includes('字幕')`);
-  assert.equal(await cdp.evaluate('document.querySelectorAll("textarea").length'), 1);
+  assert.equal(await cdp.evaluate(`document.querySelectorAll('.stream-panel textarea').length`), 1);
   assert.equal(await cdp.evaluate('document.querySelector("#context-input") === null && document.querySelector("#frame-input") === null'), true);
   const submitted = await readState();
   const assembled = submitted.trace.find(event => event.type === 'interaction.submitted').data;
@@ -96,7 +96,7 @@ try {
   await cdp.until(`document.querySelector('#function-text').textContent.includes('现在显示真实识别结果')`);
   asr.recognize({ text: '现在显示修订后的识别结果', start: activationTime + 10, end: activationTime + 200, definite: true });
   await cdp.until(`document.querySelector('#function-text').textContent.includes('修订后的识别结果')`);
-  assert.equal(await cdp.evaluate(`document.querySelector('#submit-form').closest('section').querySelectorAll('button').length`), 3);
+  assert.equal(await cdp.evaluate(`document.querySelector('#open-instruction').closest('section') === document.querySelector('#submit-form').closest('section')`), true);
   assert.equal(await cdp.evaluate(`(() => { const disc = parseFloat(getComputedStyle(document.querySelector('#audio-toggle'), '::before').height); const play = document.querySelector('#audio-toggle').getBoundingClientRect(); const esc = document.querySelector('#open-function').getBoundingClientRect(); const dictate = document.querySelector('#submit-button'); const box = dictate.getBoundingClientRect(); return play.right <= box.left && box.right <= esc.left && Math.abs(esc.height - disc) <= 1 && Math.abs(box.height - disc) <= 1 && dictate.textContent === '口述指令' && esc.textContent === '关闭功能面板'; })()`), true);
   const inputCountBeforeStop = submitted.trace.filter(event => event.type === 'interaction.submitted').length;
   await cdp.evaluate(`document.querySelector('#open-function').click()`);

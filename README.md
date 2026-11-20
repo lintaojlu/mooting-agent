@@ -102,7 +102,7 @@ Python 不读取 macOS 系统代理；需要代理下载模型时，设置 `MOOT
 - **写入**：每条 ASR 定稿立刻进最近原话（内存 + `data/fragments.jsonl`）和 outbox（`data/hindsight-outbox.jsonl`）。攒够 20 句或 2000 字、静默 60 秒、语音暂停或停止，任一成立且 Router 空闲时，按天追加到 `stream-<日期>` 文档。Router 每轮在 `turn/end` 写入 `turn-<inputId>`，被打断的那一轮不写。退出前强制提交剩余内容。异步请求被受理后仍保留在磁盘 outbox，只有 operation 状态为 `completed` 才移除；失败时退避重试，断线或重启后继续确认。同一 `operation_id` 重放避免重复提交，同一天的 append 按顺序执行。说话人一律标为「未确认」。
 - **记住 / 忘掉 / 纠正**：「记住……」立即进本地缓存，并提交 `async: false` 的 retain（`explicit` 标签）；远端未成功时仍保留待写内容。「忘掉……」立即用墓碑过滤注入内容与工具结果，删除意图持久化，离线时等待恢复后执行。「不对，王磊是产品经理」这类更正会保留新说法，并以主语「王磊」保守屏蔽旧缓存，随后清理远端旧来源。识别依赖固定中文句式和文本匹配，详见下方限制。
 - **每轮输入**：不发网络请求、不调模型，只读内存。最近 **1 分钟内全部定稿原话** 按顺序写进 Router 的 user prompt；按钮收束得到的 command 放在独立「用户指令」节，旧原话不能作为额外授权。旧版不经采集按钮的语音交互会把最近一分钟原话交给 Router，要求它提取最后一个明确、完整的 command；没有指令时不调用工具。长期记忆的用户档案（500 字）、进行中事项（500 字）、相关人物（按姓名和别名命中指令与最近原话，最多 3 人，每人 150 字）仍经 system prompt 注入，不重复塞入原话。三份 mental model（`user-profile`、`people`、`open-items`）每 60 秒拉取一次，存入 `data/memory-cache.json`。面板的「最近原话」只显示最近一分钟内的定稿。
-- **Router 工具（只读）**：`memory_search` 同步召回，3 秒超时返回空结果；`memory_reflect` 在 Worker 后台综合回答，60 秒超时，完成后唤醒 Router 回报。Router 没有写记忆的工具。
+- **Router 工具（只读）**。`memory_search` 同步召回，最多等待 8 秒，超时后返回空结果和说明。`memory_reflect` 在 Worker 后台综合回答，超时上限为 60 秒，完成后唤醒 Router 回报。
 
 Context 面板显示服务状态、outbox 积压、三份 mental model 的更新时间和上次写入结果。独立的 Context System Trace 记录每轮从缓存读取的档案/事项/人物、最近一分钟原话、实际注入 Router 的文本与 user prompt；写入侧记录定稿/回合原文、待写批次、向 Hindsight 发送的完整正文和返回结果，以及后续 operation 状态、缓存刷新、检索与回想、失败和重试。列表直接显示正文摘要，展开可看全文及原始字段。轨迹含私人对话原文，持久化在权限受限的 `data/context-trace.jsonl`，页面通过受登录保护的 `/api/context/trace` 读取完整历史，实时状态流只带最近 200 条；旧版运行期间没有记录正文的事件不能补出正文。它记录本应用 Context 的调用边界，不是 Hindsight Python 守护进程内部逐 token 日志。Agent Trace 保持 DSH 原有的 Router/工具轨迹。会话日志保留历次记忆快照用于追溯；发送给模型时仅投影最新的 `mooting-memory` 快照，避免旧记忆反复累加和被纠正的缓存继续出现。删除最后一条记忆也会生成替换快照，声明旧快照失效。
 
@@ -199,3 +199,15 @@ node tests/hindsight-live.mjs   # 预热测试守护进程（下载依赖），�
 - 本地音频 WebSocket 只允许同源 loopback 页面与单浏览器连接；远程部署需另行设计 HTTPS、鉴权与设备连接。
 - 会话和任务在内存中，重启清空；模型/ASR 配置保存在 `.env`。原始音频只保留有限传输缓冲，不长期落盘。
 - DSH 视图未集成附件、文件导航、对话分叉和完整 GUI RPC 工具结果追踪。
+
+### 诊断日志
+
+服务异步追加写入 `data/logs/YYYY-MM-DD.log`。配置 `MOOTING_DATA_ROOT` 时使用该目录下的 `logs/`。文件按服务端本地日期分日，每行一个 JSON 对象。UTC 时间戳为 `ts`，各阶段耗时以毫秒记录。`MOOTING_LOG_LEVEL` 可设置最低级别，默认 `debug`，另有 `info`、`warning`、`error`。日志文件由本地运维管理保留时间。
+
+在 Agent Trace 中复制 Trace ID，从仓库目录运行以下命令。查询会读取每日文件，并纳入关联的 Worker、记忆批次和延迟回报。
+
+```sh
+node src/log/query.mjs TRACE_ID
+```
+
+`interaction.first_output` 标记首段文本进入服务端输出，`interaction.end` 标记 Router 完成，`web.sse.delivery` 标记对应状态写入 SSE 的时间。模型首 token、工具耗时、记忆检索、排队、重试和后台任务都有各自的事件。日志字段限定在诊断元数据，聊天正文、凭证、模型提示词和工具参数留在各自原有的数据流程中。

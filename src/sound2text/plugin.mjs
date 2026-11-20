@@ -25,6 +25,7 @@ export default class Sound2TextPlugin extends Service {
     return new VoiceprintDirectory({ apiKey });
   }
   enrollmentClip(startMs, endMs) { return this.engine.enrollmentClip(startMs, endMs); }
+  utteranceTiming(utterance) { return this.engine.utteranceTiming(utterance); }
   voiceEndMs() { return this.engine.voiceEndMs(); }
   /** Register a saved speaker from kept PCM. The hosted URL is supplied by the web layer. */
   async registerFromPcm(name, clip, { audioUrl } = {}) {

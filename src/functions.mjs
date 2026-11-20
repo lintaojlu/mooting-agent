@@ -1,3 +1,4 @@
+import { log, timed } from './log/index.mjs';
 import { subtitleText } from './capabilities.mjs';
 import { InputError } from './tasks.mjs';
 
@@ -43,7 +44,9 @@ export class FunctionPanel {
   person() { return this.speaker.person ? structuredClone(this.speaker.person) : null; }
   open(kind, signal) {
     const generation = this.generation;
-    return this.enqueue(() => this.openNow(kind, signal, generation));
+    return timed('function.open', () => this.enqueue(() => this.openNow(kind, signal, generation)), { kind }, {
+      result: value => value.cancelled ? 'cancelled' : value.opened ? 'ok' : 'rejected',
+    });
   }
   close(kind) {
     return this.enqueue(() => this.closeNow(kind));
@@ -112,6 +115,7 @@ export class FunctionPanel {
     return { stopped: true };
   }
   clear() {
+    log('info', 'function.closed', { kind: this.active });
     this.generation++;
     const handle = this.handle;
     this.handle = null;

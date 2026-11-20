@@ -1,3 +1,4 @@
+import { createTrace, currentTrace, elapsed, errorFields, failure, log, outcomeLevel, runWithTrace, timed, traceIds } from './log/index.mjs';
 import { randomUUID } from 'node:crypto';
 
 export class InputError extends Error { constructor(message, status = 400) { super(message); this.status = status; } }
@@ -16,6 +17,7 @@ export function snapshotInput(value) {
 export class TaskManager {
   #tasks = new Map();
   #handles = new Map();
+  #timings = new Map();
   #capabilities = new Map();
   #active = undefined;
   #executions = new Set();
@@ -46,7 +48,11 @@ export class TaskManager {
   }
   capabilities() { return [...this.#capabilities.values()].map(({ id, description }) => ({ id, description })); }
   tasks() { return structuredClone([...this.#tasks.values()]); }
-  async start(plan, snapshot, signal, { isCurrent = () => true } = {}) {
+  start(plan, snapshot, signal, options) {
+    const trace = createTrace('worker', traceIds());
+    return runWithTrace(trace, () => this.startBody(plan, snapshot, signal, options));
+  }
+  async startBody(plan, snapshot, signal, { isCurrent = () => true } = {}) {
     if (!plan || !this.#capabilities.has(plan.capability)) throw new InputError('未知能力，未执行');
     signal?.throwIfAborted();
     const capability = this.#capabilities.get(plan.capability);
@@ -58,6 +64,10 @@ export class TaskManager {
       this.#tasks.delete(terminal[0]);
     }
     this.#tasks.set(task.id, task);
+    const timing = { start: performance.now(), trace: currentTrace() };
+    this.#timings.set(task.id, timing);
+    const fields = { taskId: task.id, inputId: task.inputId, operation: capability.id };
+    log('info', 'worker.start', fields, timing.trace);
     this.emit('worker.starting', { capability: capability.id, execution_kind: plan.execution_kind }, task.id);
     try {
       if (capability.continuous && this.#active) await this.stop(this.#active, 'replaced');
@@ -73,6 +83,7 @@ export class TaskManager {
       if (capability.continuous && !isCurrent()) throw new DOMException('持续功能启动已被新的交互打断', 'AbortError');
       task.status = 'running';
       if (capability.continuous) this.#active = task.id;
+      log('debug', 'worker.ready', { ...fields, elapsedMs: elapsed(timing.start) }, timing.trace);
       this.emit('worker.ready', { capability: capability.id, continuous: !!capability.continuous }, task.id);
       if (capability.continuous) {
         this.display(capability.id, true, undefined, task.id);
@@ -84,12 +95,17 @@ export class TaskManager {
         task.status = 'completed';
         this.emit('worker.completed', { result: task.result }, task.id);
       }
+      log('info', 'worker.report', { ...fields, outcome: task.status === 'completed' ? 'ok' : 'running', elapsedMs: elapsed(timing.start) }, timing.trace);
+      if (task.status === 'completed') this.#timings.delete(task.id);
       this.emit('worker.report', { status: task.status, result: task.result }, task.id);
       return structuredClone(task);
     } catch (error) {
       await this.#handles.get(task.id)?.dispose?.(); this.#handles.delete(task.id);
       if (this.#active === task.id) { this.#active = undefined; this.display(task.capability, false); }
       task.status = signal?.aborted || error.name === 'AbortError' ? 'cancelled' : 'failed'; task.result = { error: error.message };
+      this.#timings.delete(task.id);
+      const outcome = task.status === 'cancelled' ? 'cancelled' : failure(error);
+      log(outcomeLevel(outcome), 'worker.report', { ...fields, ...errorFields(error), outcome, elapsedMs: elapsed(timing.start) }, timing.trace);
       this.emit(`worker.${task.status}`, task.result, task.id);
       this.emit('worker.report', { status: task.status, result: task.result }, task.id); throw error;
     }
@@ -97,6 +113,14 @@ export class TaskManager {
   async stop(id, reason = 'user_interaction') {
     const task = this.#tasks.get(id);
     if (!task || task.status !== 'running') return;
+    const timing = this.#timings.get(id);
+    return timed('worker.stop', () => this.stopBody(task, reason), {
+      taskId: id, reason, durationMs: timing ? elapsed(timing.start) : undefined,
+    }, { trace: timing?.trace });
+  }
+  async stopBody(task, reason) {
+    const id = task.id;
+    this.#timings.delete(id);
     task.status = 'stopping'; this.emit('worker.stopping', { reason }, id);
     // A display lease is revoked before disposal, so late frames cannot reappear.
     if (this.#active === id) { this.#active = undefined; this.display(task.capability, false); }

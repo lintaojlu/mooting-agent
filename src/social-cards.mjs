@@ -1,3 +1,4 @@
+import { elapsed, log, timed } from './log/index.mjs';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
@@ -79,7 +80,10 @@ export class SocialCardStore extends EventEmitter {
   emitChange() { this.emit('change'); }
   persist() {
     const text = JSON.stringify({ cards: this.cards }, null, 2) + '\n';
-    const run = this.writes.then(() => writePrivate(this.path, text));
+    const queuedAt = performance.now();
+    const run = this.writes.then(() => timed('social.store.persist', () => writePrivate(this.path, text), {
+      queueMs: elapsed(queuedAt),
+    }));
     this.writes = run.catch(() => {});
     return run;
   }
@@ -150,11 +154,12 @@ export class SocialCardQueue extends EventEmitter {
   active() { return this.cards.find(card => card.id === this.activeId && card.state === 'active') ?? null; }
   pendingCount() { return this.cards.filter(card => card.state !== 'closed').length; }
   activeConfirm() { const card = this.active(); return card?.kind === 'confirm' ? card : null; }
-  findView(speakerKey) { return this.cards.find(card => card.kind === 'view' && card.speakerKey === speakerKey && card.state !== 'closed') ?? null; }
+  findView(speakerKey, username) { return this.cards.find(card => card.kind === 'view' && card.speakerKey === speakerKey && card.username === username && card.state !== 'closed') ?? null; }
   push(card) {
     return this.enqueue(() => {
       const entry = { id: randomUUID(), state: 'queued', ...card };
       this.cards.push(entry);
+      log('debug', 'social.card.queued', { cardId: entry.id, kind: entry.kind });
       this.promote();
       this.emitChange();
       return entry;
@@ -167,26 +172,34 @@ export class SocialCardQueue extends EventEmitter {
     waiting.sort((left, right) => right.priority - left.priority);
     const next = waiting[0];
     next.state = 'active';
+    log('info', 'social.card.shown', { cardId: next.id, kind: next.kind });
     this.activeId = next.id;
   }
-  closeActive({ interrupt = false } = {}) {
+  closeActive({ id, interrupt = false } = {}) {
     return this.enqueue(() => {
       const card = this.active();
+      if (id && card?.id !== id) { const error = new Error('社交卡片已切换'); error.status = 409; throw error; }
       if (!card) return { closed: false };
       if (card.kind === 'confirm' && !interrupt) { const error = new Error('请先保存或不保存这张社交卡片'); error.status = 409; throw error; }
       card.state = 'closed';
+      log('info', 'social.card.closed', { cardId: card.id, kind: card.kind });
       this.activeId = null;
       this.promote();
       this.emitChange();
       return { closed: true, card };
     });
   }
-  async resolveActive(save) {
+  async resolveActive(save, { id, username } = {}) {
     return this.enqueue(async () => {
       const card = this.activeConfirm();
-      if (!card) { const error = new Error('当前没有待保存的社交卡片'); error.status = 409; throw error; }
+      if (!card || card.username !== username || (id && card.id !== id)) {
+        const error = new Error('当前卡片已处理或切换，请查看最新状态');
+        error.status = 409;
+        throw error;
+      }
       const result = await save(card);
       card.state = 'closed';
+      log('info', 'social.card.closed', { cardId: card.id, kind: card.kind });
       this.activeId = null;
       this.promote();
       this.emitChange();

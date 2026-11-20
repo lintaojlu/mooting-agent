@@ -1,4 +1,5 @@
-import { join, resolve } from 'node:path';
+import { resolveDataRoot } from '../log/index.mjs';
+import { join } from 'node:path';
 import { rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { Service } from '@deepseek-ai/cordis';
@@ -21,7 +22,7 @@ export default class MootingContext extends Service {
   constructor(ctx, config = {}) {
     super(ctx, 'mootingContext');
     this.envPath = config.envPath ?? (process.env.MOOTING_HOME ? join(process.env.DSH_HOME ?? process.env.MOOTING_HOME, '.env') : fileURLToPath(new URL('../../.env', import.meta.url)));
-    this.dataRoot = config.dataRoot ?? (process.env.MOOTING_DATA_ROOT ? resolve(process.env.MOOTING_DATA_ROOT) : fileURLToPath(new URL('../../data/', import.meta.url)));
+    this.dataRoot = config.dataRoot ?? resolveDataRoot();
     // Hindsight starts in the background: a first start downloads the Python env and local models.
     this.bridge = new HindsightBridge({ envPath: this.envPath, logger: config.logger ?? consoleLogger });
     this.context = new ContextSystem({ dataRoot: this.dataRoot, bridge: this.bridge });

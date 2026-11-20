@@ -14,7 +14,7 @@ const state = () => ({ sessionId: 'main', mode: 'unconfigured', busy: false, eve
 test('sole business submission contains only instruction', () => {
   assert.deepEqual(plain(ui.submission(' 开启字幕 ')), { instruction: '开启字幕' });
   assert.throws(() => ui.submission(' ')); assert.throws(() => ui.submission('a'.repeat(4001)));
-  assert.equal((html.match(/<textarea\b/g) || []).length, 2);
+  assert.match(html, /<dialog id="instruction-dialog"[\s\S]*?<textarea id="instruction-input"[^>]*maxlength="4000"[^>]*required/);
   assert.doesNotMatch(html, /id="(?:context-input|frame-input)"/);
 });
 test('state accepts explicit unconfigured mode and requires actual DSH events', () => {
@@ -136,7 +136,7 @@ test('output and control/stream/Router row, Context row, and separate traces use
   assert.doesNotMatch(app, /\$\('close-agent'\)|\$\('esc-button'\)/);
   assert.match(html, /id="inform_stream"[^>]*rows="2"[^>]*readonly/);
   assert.match(app, /request\('\/api\/context\/trace'\)/);
-  assert.match(app, /renderContextTrace\(state\.context\.trace\)/);
+  assert.match(app, /renderContextTrace\(state\.context\.trace, state\.context\.traceClearedThrough\)/);
   assert.doesNotMatch(html + app, /🔘/);
 });
 test('Context System Trace shows readable events with full details available separately', () => {
@@ -307,8 +307,7 @@ test('all element bindings exist and secrets are never refilled from public conf
   assert.match(html, /type="password"/);
 });
 test('network operations are backend-only and submit requires model configuration', () => {
-  for (const path of ['/api/model/config', '/api/state', '/api/events', '/api/voice/interaction', '/api/function/open', '/api/interaction']) assert.ok(app.includes("'" + path + "'"));
-  assert.doesNotMatch(app, /\/api\/submit/);
+  for (const path of ['/api/model/config', '/api/state', '/api/events', '/api/submit', '/api/voice/interaction', '/api/function/open', '/api/interaction']) assert.ok(app.includes("'" + path + "'"));
   assert.match(app, /config\?\.configured === true/);
   assert.match(app, /addEventListener\('data', receive\)/);
   assert.match(app, /不会切换为模拟模型/);

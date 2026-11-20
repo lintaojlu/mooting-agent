@@ -1,6 +1,7 @@
+import { createTrace, elapsed, errorFields, failure, log, outcomeLevel, runWithTrace, timed, traceIds } from '../log/index.mjs';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
-import { appendFile, chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MENTAL_MODELS, MemoryUnavailableError, publicServiceSettings } from './hindsight.mjs';
@@ -11,11 +12,13 @@ export const LIMITS = Object.freeze({
   profile: 500, openItems: 500, people: 3, person: 150,
   recentMs: 10 * 60_000, recentCount: 30, recentChars: 1500,
   flushCount: 20, flushChars: 2000, silenceMs: 60_000,
-  cacheIntervalMs: 60_000, searchTimeoutMs: 3_000, reflectTimeoutMs: 60_000,
+  cacheIntervalMs: 60_000, searchTimeoutMs: 8_000, reflectTimeoutMs: 60_000,
 });
 export const MEMORY_NOTE = '记忆可能滞后，以最近原话为准；没有的细节用 memory_search 去查。';
 const STREAM_CONTEXT = '现场对话，说话人未确认';
 const TURN_CONTEXT = 'MootingAgent 助手与用户对话';
+const CLEARING = '记忆正在清空或等待重试';
+const emptyCache = () => ({ models: {}, explicit: [], tombstones: [], fetchedAt: null });
 
 /** Recover the command from the Router user message. Text without that section is the command itself. */
 export function commandFromPrompt(prompt) {
@@ -87,6 +90,8 @@ async function readLines(path) {
   } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
 }
 
+const traceReferences = items => items.flatMap(item => Array.isArray(item.traceIds) ? item.traceIds : []);
+
 /**
  * Context System on top of Hindsight.
  * Hot path (observe, compile) touches RAM only. Writes reach Hindsight through a durable outbox,
@@ -100,8 +105,10 @@ export class ContextSystem extends EventEmitter {
     this.outboxPath = join(this.dataRoot, 'hindsight-outbox.jsonl');
     this.cachePath = join(this.dataRoot, 'memory-cache.json');
     this.tracePath = join(this.dataRoot, 'context-trace.jsonl');
+    this.resetPath = join(this.dataRoot, 'memory-reset.json');
     this.trace = [];
     this.traceCount = 0;
+    this.traceClearedThrough = 0;
     this.traceWrites = Promise.resolve();
     this.bridge = bridge;
     this.limits = { ...LIMITS, ...limits };
@@ -109,7 +116,7 @@ export class ContextSystem extends EventEmitter {
     this.fragments = [];
     this.items = [];
     this.batches = [];
-    this.cache = { models: {}, explicit: [], tombstones: [], fetchedAt: null };
+    this.cache = emptyCache();
     this.seen = new Set();
     this.routerBusy = false;
     this.flushWanted = false;
@@ -123,22 +130,31 @@ export class ContextSystem extends EventEmitter {
     this.retryDelay = 5_000;
     this.cacheTimer = null;
     this.background = new Set();
+    this.memoryGeneration = 0;
+    this.clearing = false;
+    this.resetPending = null;
     this.ready = this.load();
   }
   async load() {
     await mkdir(this.dataRoot, { recursive: true, mode: 0o700 });
     const history = await readLines(this.tracePath);
     this.traceCount = history.reduce((maximum, entry) => Math.max(maximum, Number(entry.seq) || 0), 0);
-    this.trace = history.slice(-200);
+    const lastClear = history.findLast(entry => entry.type === 'memory.clear');
+    if (lastClear) this.traceClearedThrough = lastClear.seq - 1;
+    this.resetPending = await readJson(this.resetPath, null);
+    if (this.resetPending) this.traceClearedThrough = this.traceCount;
+    else this.trace = history.slice(-200);
     this.traceEvent('context.load.start');
-    this.fragments = (await readLines(this.fragmentsPath)).filter(item => typeof item.text === 'string' && item.text.trim())
-      .map(item => ({ at: typeof item.at === 'string' ? item.at : null, text: item.text })).slice(-FRAGMENT_RAM);
-    for (const record of await readLines(this.outboxPath)) {
-      if (record.type === 'item' && record.item) this.items.push(record.item);
-      if (record.type === 'batch' && record.batch?.operationId) this.batches.push(record.batch);
+    if (!this.resetPending) {
+      this.fragments = (await readLines(this.fragmentsPath)).filter(item => typeof item.text === 'string' && item.text.trim())
+        .map(item => ({ at: typeof item.at === 'string' ? item.at : null, text: item.text })).slice(-FRAGMENT_RAM);
+      for (const record of await readLines(this.outboxPath)) {
+        if (record.type === 'item' && record.item) this.items.push(record.item);
+        if (record.type === 'batch' && record.batch?.operationId) this.batches.push(record.batch);
+      }
+      const cache = await readJson(this.cachePath, null);
+      if (cache && typeof cache === 'object') this.cache = { models: cache.models ?? {}, explicit: Array.isArray(cache.explicit) ? cache.explicit : [], tombstones: Array.isArray(cache.tombstones) ? cache.tombstones : [], fetchedAt: cache.fetchedAt ?? null };
     }
-    const cache = await readJson(this.cachePath, null);
-    if (cache && typeof cache === 'object') this.cache = { models: cache.models ?? {}, explicit: Array.isArray(cache.explicit) ? cache.explicit : [], tombstones: Array.isArray(cache.tombstones) ? cache.tombstones : [], fetchedAt: cache.fetchedAt ?? null };
     if (this.bridge) {
       this.onBridgeStatus = () => { this.traceEvent('hindsight.status', this.service()); if (this.bridge.ready) { this.refreshCache().catch(() => {}); this.flush({ reason: 'reconnect' }); } };
       this.bridge.on('status', this.onBridgeStatus);
@@ -151,13 +167,27 @@ export class ContextSystem extends EventEmitter {
   }
   traceEvent(type, data = {}) {
     if (this.closed) return;
+    const outcome = data.outcome ?? (type.endsWith('.failed') ? 'failed'
+      : /\.(unavailable|offline)$/.test(type) ? 'unavailable' : type.endsWith('.deferred') ? 'deferred' : undefined);
+    const level = type.endsWith('.retry') ? 'warning' : outcome ? outcomeLevel(outcome) : /\.(end|completed|ready)$/.test(type) ? 'info' : 'debug';
+    log(level, type.startsWith('context.') ? type : `context.${type}`, {
+      outcome, kind: data.kind, phase: data.status, reason: data.reason, inputId: data.inputId,
+      operationId: data.operationId, pending: data.pending, queued: data.queued,
+      pendingItems: data.pendingItems, pendingBatches: data.pendingBatches,
+      count: data.count ?? data.results?.length, elapsedMs: data.elapsedMs, timeoutMs: data.timeoutMs, delayMs: data.delayMs,
+    });
     const entry = { seq: ++this.traceCount, at: new Date(this.now()).toISOString(), type, data };
     this.trace.push(entry);
     if (this.trace.length > 200) this.trace.shift();
-    this.traceWrites = this.traceWrites.then(() => appendFile(this.tracePath, JSON.stringify(entry) + '\n', { mode: 0o600 })).catch(error => { this.error = `Context 轨迹写入失败：${error.message}`; this.changed(); });
+    this.traceWrites = this.traceWrites.then(() => appendFile(this.tracePath, JSON.stringify(entry) + '\n', { mode: 0o600 })).catch(error => { log('error', 'context.trace.persist_failed', errorFields(error)); this.error = `Context 轨迹写入失败：${error.message}`; this.changed(); });
     this.changed();
   }
-  async traceHistory() { await this.ready; await this.traceWrites; return readLines(this.tracePath); }
+  async traceHistory() {
+    await this.ready;
+    await this.traceWrites;
+    return (await readLines(this.tracePath)).filter(entry => entry.seq > this.traceClearedThrough);
+  }
+  get memoryPaused() { return this.clearing || !!this.resetPending; }
   changed() { if (!this.closed) this.emit('change'); }
   service() {
     if (!this.bridge) return { status: 'disabled' };
@@ -169,7 +199,9 @@ export class ContextSystem extends EventEmitter {
     const models = Object.fromEntries(MENTAL_MODELS.map(model => [model.id, this.cache.models[model.id]?.updatedAt ?? null]));
     return {
       memory: this.compile('', { includeRecent: false }),
-      trace: this.trace.slice(), traceCount: this.traceCount,
+      trace: this.trace.slice(), traceCount: this.traceCount - this.traceClearedThrough,
+      traceClearedThrough: this.traceClearedThrough,
+      clearing: this.clearing, resetPending: !!this.resetPending,
       fragments: this.fragments.filter(item => {
         const at = Date.parse(item.at);
         return Number.isFinite(at) && at >= this.now() - 60_000 && at <= this.now() && !this.forgotten(item.text);
@@ -190,24 +222,79 @@ export class ContextSystem extends EventEmitter {
 
   persist(job) {
     const run = this.writes.then(job, job);
-    this.writes = run.catch(error => { this.error = `本地记忆写入失败：${error.message}`; this.changed(); });
+    this.writes = run.catch(error => { log('error', 'context.persist_failed', errorFields(error)); this.error = `本地记忆写入失败：${error.message}`; this.changed(); });
     return this.writes;
   }
   saveOutbox({ durable = false } = {}) {
     const lines = [...this.batches.map(batch => ({ type: 'batch', batch })), ...this.items.map(item => ({ type: 'item', item }))];
     const text = lines.map(line => JSON.stringify(line)).join('\n') + (lines.length ? '\n' : '');
     const run = this.writes.then(() => writePrivate(this.outboxPath, text));
-    this.writes = run.catch(error => { this.error = `本地记忆写入失败：${error.message}`; this.changed(); });
+    this.writes = run.catch(error => { log('error', 'context.persist_failed', errorFields(error)); this.error = `本地记忆写入失败：${error.message}`; this.changed(); });
     return durable ? run : this.writes;
   }
   saveCache({ durable = false } = {}) {
     const text = JSON.stringify(this.cache);
     const run = this.writes.then(() => writePrivate(this.cachePath, text));
-    this.writes = run.catch(error => { this.error = `本地记忆写入失败：${error.message}`; this.changed(); });
+    this.writes = run.catch(error => { log('error', 'context.persist_failed', errorFields(error)); this.error = `本地记忆写入失败：${error.message}`; this.changed(); });
     return durable ? run : this.writes;
   }
+  async clearMemory(clearConversations) {
+    return timed('context.clear', () => this.clearMemoryBody(clearConversations));
+  }
+  async clearMemoryBody(clearConversations) {
+    await this.ready;
+    if (this.closed || this.clearing) throw new MemoryUnavailableError(CLEARING);
+    const remote = this.resetPending?.remote || !!(this.bridge && !['disabled', 'unconfigured'].includes(this.bridge.status));
+    if (remote && !this.bridge?.ready) throw new MemoryUnavailableError('记忆服务未就绪，请稍后重试');
+
+    this.clearing = true;
+    this.memoryGeneration++;
+    this.changed();
+    try {
+      await this.idle();
+      if (remote) await this.bridge.waitForBankWrites();
+      clearTimeout(this.silenceTimer);
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+      this.retryDelay = 5_000;
+      this.flushWanted = false;
+
+      // A restart after a partial clear must not replay the old outbox or reload the old cache.
+      await writePrivate(this.resetPath, JSON.stringify({ remote }));
+      this.resetPending = { remote };
+      this.fragments = [];
+      this.items = [];
+      this.batches = [];
+      this.cache = emptyCache();
+      this.lastFlush = null;
+      this.error = undefined;
+      await writePrivate(this.fragmentsPath, '');
+      await this.saveOutbox({ durable: true });
+      await this.saveCache({ durable: true });
+      await this.traceWrites;
+      this.traceClearedThrough = this.traceCount;
+      const entry = { seq: ++this.traceCount, at: new Date(this.now()).toISOString(), type: 'memory.clear', data: {} };
+      this.trace = [entry];
+      const replaceTrace = writePrivate(this.tracePath, JSON.stringify(entry) + '\n');
+      this.traceWrites = replaceTrace.catch(() => {});
+      await replaceTrace;
+
+      if (remote) {
+        await this.bridge.deleteBank();
+        await this.bridge.initializeBank();
+      }
+      await clearConversations?.();
+      await rm(this.resetPath);
+      this.resetPending = null;
+      return { ok: true, longTermCleared: remote };
+    } finally {
+      this.clearing = false;
+      if (!this.resetPending && (this.items.length || this.batches.length)) this.scheduleRetry();
+      this.changed();
+    }
+  }
   /** Accept one information-stream snapshot. Each newly finalized utterance is readable at once and queued for Hindsight. */
-  observe(snapshot) {
+  observe(snapshot, utteranceTrace = () => undefined) {
     if (this.closed || !['running', 'stopping'].includes(snapshot?.status)) return;
     let added = false;
     for (const utterance of snapshot.utterances ?? []) {
@@ -220,11 +307,12 @@ export class ContextSystem extends EventEmitter {
       if (this.seen.has(key)) continue;
       this.seen.add(key);
       if (this.seen.size > 400) this.seen.delete(this.seen.values().next().value);
+      if (this.memoryPaused) continue;
       const at = new Date(this.now()).toISOString();
       const fragment = { at, text };
       this.fragments.push(fragment);
       if (this.fragments.length > FRAGMENT_RAM) this.fragments.splice(0, this.fragments.length - FRAGMENT_RAM);
-      this.items.push({ kind: 'stream', at, text, ...(speaker ? { speaker } : {}), start_time: utterance.start_time });
+      this.items.push({ kind: 'stream', at, text, traceIds: traceIds(utteranceTrace(utterance)), ...(speaker ? { speaker } : {}), start_time: utterance.start_time });
       this.traceEvent('speech.final', { text, startTime: utterance.start_time, queued: this.items.length + this.batches.length });
       this.persist(async () => { await appendFile(this.fragmentsPath, JSON.stringify(fragment) + '\n', { mode: 0o600 }); await chmod(this.fragmentsPath, 0o600); });
       added = true;
@@ -251,12 +339,12 @@ export class ContextSystem extends EventEmitter {
   }
   /** One completed Router turn. Interrupted turns never reach here. */
   recordTurn({ inputId, user, assistant, report } = {}) {
-    if (this.closed) return;
+    if (this.closed || this.memoryPaused) return;
     const answer = String(assistant ?? '').trim();
     const asked = String(user ?? '').trim();
     if (!answer || (!asked && !report) || memoryCommand(asked)?.kind === 'forget') return;
     if (this.forgotten([asked, answer, report].filter(Boolean).join('\n'))) return;
-    this.items.push({ kind: 'turn', at: new Date(this.now()).toISOString(), inputId: inputId || randomUUID(), user: asked, assistant: answer, ...(report ? { report: clip(report, 600) } : {}) });
+    this.items.push({ kind: 'turn', traceIds: traceIds(), at: new Date(this.now()).toISOString(), inputId: inputId || randomUUID(), user: asked, assistant: answer, ...(report ? { report: clip(report, 600) } : {}) });
     this.traceEvent('turn.queued', { inputId, user: asked, assistant: answer, report: report ? clip(report, 600) : undefined });
     this.flushWanted = true;
     this.saveOutbox();
@@ -276,13 +364,13 @@ export class ContextSystem extends EventEmitter {
         if (item.report) lines.push(`[${localStamp(item.at)}] 后台记忆查询回报：${item.report}`);
         if (item.user) lines.push(`[${localStamp(item.at)}] 用户：${item.user}`);
         lines.push(`[${localStamp(item.at)}] 助手：${item.assistant}`);
-        this.batches.push({ operationId: randomUUID(), kind: 'turn', documentId: `turn-${item.inputId}`, content: lines.join('\n'), timestamp: item.at, context: TURN_CONTEXT, count: 1 });
+        this.batches.push({ operationId: randomUUID(), kind: 'turn', traceIds: item.traceIds, documentId: `turn-${item.inputId}`, content: lines.join('\n'), timestamp: item.at, context: TURN_CONTEXT, count: 1 });
       }
     }
     for (const [day, list] of streams) {
       const labeled = list.some(item => item.speaker);
       const content = list.map(item => `[${localStamp(item.at)}] ${item.speaker ? item.text : `未确认说话人：${item.text}`}`).join('\n');
-      this.batches.push({ operationId: randomUUID(), kind: 'stream', documentId: `stream-${day}`, updateMode: 'append', content, timestamp: list[0].at, context: labeled ? '现场对话，行首是说话人' : STREAM_CONTEXT, count: list.length });
+      this.batches.push({ operationId: randomUUID(), kind: 'stream', traceIds: traceReferences(list), documentId: `stream-${day}`, updateMode: 'append', content, timestamp: list[0].at, context: labeled ? '现场对话，行首是说话人' : STREAM_CONTEXT, count: list.length });
     }
     this.items = [];
   }
@@ -291,16 +379,21 @@ export class ContextSystem extends EventEmitter {
    * Failures keep the batch and retry with backoff.
    */
   flush({ force = false, explicitOnly = false, reason = 'manual' } = {}) {
+    if (this.memoryPaused) return Promise.resolve(false);
     if (this.routerBusy && !force) { if (this.items.length || this.batches.length || this.cache.tombstones.some(item => item.pending)) { this.flushWanted = true; this.traceEvent('flush.deferred', { reason, pending: this.items.length + this.batches.length }); } return Promise.resolve(false); }
     if (this.flushing) { this.flushAgain = { force: this.flushAgain?.force || force, explicitOnly: this.flushAgain ? this.flushAgain.explicitOnly && explicitOnly : explicitOnly, reason }; return this.flushing; }
-    this.traceEvent('flush.start', { reason, force, explicitOnly, pendingItems: this.items.length, pendingBatches: this.batches.length });
+    const trace = createTrace('memory_flush', traceReferences([...this.items, ...this.batches, ...this.cache.tombstones.filter(item => item.pending)]));
+    runWithTrace(trace, () => this.traceEvent('flush.start', { reason, force, explicitOnly, pendingItems: this.items.length, pendingBatches: this.batches.length }));
     this.flushWanted = false;
     if (!explicitOnly && reason !== 'retry') clearTimeout(this.silenceTimer);
-    this.flushing = this.flushBody({ force, explicitOnly, reason }).catch(error => {
+    this.flushing = timed('context.flush.run', () => this.flushBody({ force, explicitOnly, reason }), { reason },
+      { trace, result: value => value ? 'ok' : 'deferred' }).catch(error => {
       this.error = `写入记忆失败：${error.message}`;
       this.lastFlush = { at: new Date(this.now()).toISOString(), reason, result: 'failed', error: error.message };
-      this.traceEvent('flush.failed', { reason, documentId: this.currentBatch, error: error.message, pending: this.items.length + this.batches.length });
-      this.scheduleRetry();
+      runWithTrace(trace, () => {
+        this.traceEvent('flush.failed', { reason, documentId: this.currentBatch, error: error.message, pending: this.items.length + this.batches.length });
+        this.scheduleRetry();
+      });
       return false;
     }).finally(() => {
       this.flushing = null;
@@ -327,67 +420,73 @@ export class ContextSystem extends EventEmitter {
     for (const batch of [...this.batches]) {
       if (this.routerBusy && !force) { this.flushWanted = true; break; }
       if (explicitOnly && batch.kind !== 'explicit') continue;
-      this.currentBatch = batch.documentId;
-      this.traceEvent('outbox.read', {
-        kind: batch.kind, documentId: batch.documentId, operationId: batch.submitted ?? batch.operationId,
-        content: batch.content, context: batch.context, timestamp: batch.timestamp,
-        updateMode: batch.updateMode, tags: batch.tags, submitted: !!batch.submitted,
-      });
-      // One in-flight append per daily document preserves ordering and avoids concurrent read/modify/write.
-      if (this.batches.slice(0, this.batches.indexOf(batch)).some(item => item.documentId === batch.documentId)) { this.scheduleRetry({ pending: true }); continue; }
-      if (this.forgotten(batch.content)) {
-        if (batch.submitted) {
-          const operation = await this.bridge.operation(batch.submitted);
-          if (!['completed', 'failed', 'cancelled'].includes(operation.status)) { this.scheduleRetry({ pending: true }); continue; }
-          await this.bridge.deleteDocument(batch.documentId);
-        }
-        this.batches = this.batches.filter(item => item !== batch);
-        await this.saveOutbox({ durable: true });
-        continue;
-      }
-      if (batch.submitted) {
-        this.traceEvent('retain.check', { documentId: batch.documentId, operationId: batch.submitted });
-        const operation = await this.bridge.operation(batch.submitted);
-        this.traceEvent('retain.status', { documentId: batch.documentId, operationId: batch.submitted, content: batch.content, status: operation.status, error: operation.error_message, response: operation });
-        if (operation.status === 'failed') {
-          await this.bridge.retryOperation(batch.submitted);
-          this.error = '记忆抽取失败，已提交重试';
-          this.scheduleRetry();
-          continue;
-        }
-        if (operation.status !== 'completed') { this.scheduleRetry({ pending: true }); continue; }
-      } else {
-        this.traceEvent('retain.request', {
-          kind: batch.kind, documentId: batch.documentId, operationId: batch.operationId,
-          content: batch.content, context: batch.context, timestamp: batch.timestamp,
-          updateMode: batch.updateMode, tags: batch.tags, async: !batch.sync,
-        });
-        const response = await this.bridge.retain(batch.content, {
-          documentId: batch.documentId, timestamp: batch.timestamp, context: batch.context,
-          ...(batch.updateMode ? { updateMode: batch.updateMode } : {}),
-          ...(batch.tags ? { tags: batch.tags } : {}),
-          ...(batch.sync ? { async: false } : { async: true, operationId: batch.operationId }),
-        }, { timeoutMs: batch.sync ? 60_000 : 15_000 });
-        this.traceEvent('retain.submitted', { kind: batch.kind, documentId: batch.documentId, operationId: response.operation_id ?? batch.operationId, count: batch.count, async: !batch.sync, updateMode: batch.updateMode, content: batch.content, response });
-        if (!batch.sync && response.operation_id && this.bridge.operation) {
-          batch.submitted = response.operation_id;
-          await this.saveOutbox({ durable: true });
-          this.scheduleRetry({ pending: true });
-          continue;
-        }
-      }
-      this.batches = this.batches.filter(item => item !== batch);
-      sent += batch.count ?? 1;
-      this.traceEvent('retain.completed', { documentId: batch.documentId, kind: batch.kind, operationId: batch.submitted ?? batch.operationId, count: batch.count, content: batch.content });
-      await this.saveOutbox({ durable: true });
+      const trace = createTrace('memory_retain', traceReferences([batch]));
+      sent += await timed('context.outbox.batch', () => this.sendBatch(batch), {
+        operationId: batch.operationId, kind: batch.kind, count: batch.count, ageMs: Math.max(0, this.now() - Date.parse(batch.timestamp)),
+      }, { trace, result: count => count ? 'ok' : 'deferred' });
     }
     if (!this.batches.length) { this.error = undefined; this.retryDelay = 5_000; }
     this.lastFlush = { at: new Date(this.now()).toISOString(), reason, result: this.batches.some(batch => batch.submitted) ? 'processing' : 'ok', count: sent };
     this.traceEvent('flush.end', { ...this.lastFlush, pending: this.items.length + this.batches.length });
     return true;
   }
+  async sendBatch(batch) {
+    this.currentBatch = batch.documentId;
+    this.traceEvent('outbox.read', {
+      kind: batch.kind, documentId: batch.documentId, operationId: batch.submitted ?? batch.operationId,
+      content: batch.content, context: batch.context, timestamp: batch.timestamp,
+      updateMode: batch.updateMode, tags: batch.tags, submitted: !!batch.submitted,
+    });
+    // One in-flight append per daily document preserves ordering and avoids concurrent read/modify/write.
+    if (this.batches.slice(0, this.batches.indexOf(batch)).some(item => item.documentId === batch.documentId)) { this.scheduleRetry({ pending: true }); return 0; }
+    if (this.forgotten(batch.content)) {
+      if (batch.submitted) {
+        const operation = await this.bridge.operation(batch.submitted);
+        if (!['completed', 'failed', 'cancelled'].includes(operation.status)) { this.scheduleRetry({ pending: true }); return 0; }
+        await this.bridge.deleteDocument(batch.documentId);
+      }
+      this.batches = this.batches.filter(item => item !== batch);
+      await this.saveOutbox({ durable: true });
+      return 0;
+    }
+    if (batch.submitted) {
+      this.traceEvent('retain.check', { documentId: batch.documentId, operationId: batch.submitted });
+      const operation = await this.bridge.operation(batch.submitted);
+      this.traceEvent('retain.status', { documentId: batch.documentId, operationId: batch.submitted, content: batch.content, status: operation.status, error: operation.error_message, response: operation });
+      if (operation.status === 'failed') {
+        await this.bridge.retryOperation(batch.submitted);
+        this.error = '记忆抽取失败，已提交重试';
+        this.scheduleRetry();
+        return 0;
+      }
+      if (operation.status !== 'completed') { this.scheduleRetry({ pending: true }); return 0; }
+    } else {
+      this.traceEvent('retain.request', {
+        kind: batch.kind, documentId: batch.documentId, operationId: batch.operationId,
+        content: batch.content, context: batch.context, timestamp: batch.timestamp,
+        updateMode: batch.updateMode, tags: batch.tags, async: !batch.sync,
+      });
+      const response = await this.bridge.retain(batch.content, {
+        documentId: batch.documentId, timestamp: batch.timestamp, context: batch.context,
+        ...(batch.updateMode ? { updateMode: batch.updateMode } : {}),
+        ...(batch.tags ? { tags: batch.tags } : {}),
+        ...(batch.sync ? { async: false } : { async: true, operationId: batch.operationId }),
+      }, { timeoutMs: batch.sync ? 60_000 : 15_000 });
+      this.traceEvent('retain.submitted', { kind: batch.kind, documentId: batch.documentId, operationId: response.operation_id ?? batch.operationId, count: batch.count, async: !batch.sync, updateMode: batch.updateMode, content: batch.content, response });
+      if (!batch.sync && response.operation_id && this.bridge.operation) {
+        batch.submitted = response.operation_id;
+        await this.saveOutbox({ durable: true });
+        this.scheduleRetry({ pending: true });
+        return 0;
+      }
+    }
+    this.batches = this.batches.filter(item => item !== batch);
+    this.traceEvent('retain.completed', { documentId: batch.documentId, kind: batch.kind, operationId: batch.submitted ?? batch.operationId, count: batch.count, content: batch.content });
+    await this.saveOutbox({ durable: true });
+    return batch.count ?? 1;
+  }
   scheduleRetry({ pending = false } = {}) {
-    if (this.closed || this.retryTimer) return;
+    if (this.closed || this.memoryPaused || this.retryTimer) return;
     const delay = pending ? 5_000 : this.retryDelay;
     if (!pending) this.retryDelay = Math.min(this.retryDelay * 2, 5 * 60_000);
     this.retryTimer = setTimeout(() => { this.retryTimer = null; this.flush({ reason: 'retry' }); }, delay);
@@ -400,7 +499,7 @@ export class ContextSystem extends EventEmitter {
   /** Act on 记住 / 忘掉 / 纠正 commands. Local effect is immediate; Hindsight follows in the background. */
   command(instruction) {
     const parsed = memoryCommand(instruction);
-    if (!parsed || this.closed) return null;
+    if (!parsed || this.closed || this.memoryPaused) return null;
     const at = new Date(this.now()).toISOString();
     this.traceEvent(`memory.${parsed.kind}`, { text: parsed.text });
     if (parsed.kind === 'forget') {
@@ -416,7 +515,7 @@ export class ContextSystem extends EventEmitter {
       this.cache.explicit.push({ id, at, text, kind: parsed.kind });
       if (this.cache.explicit.length > 50) this.cache.explicit.splice(0, this.cache.explicit.length - 50);
       this.batches.push({
-        operationId: randomUUID(), kind: 'explicit', sync: true, documentId: `explicit-${id}`, tags: ['explicit'], timestamp: at, count: 1,
+        operationId: randomUUID(), kind: 'explicit', traceIds: traceIds(), sync: true, documentId: `explicit-${id}`, tags: ['explicit'], timestamp: at, count: 1,
         content: `[${localStamp(at)}] 用户明确要求记住：${text}`,
         context: parsed.kind === 'correct' ? '用户纠正之前的说法，以此为准' : '用户明确要求记住',
       });
@@ -436,7 +535,7 @@ export class ContextSystem extends EventEmitter {
   addTombstone(text, at, { replacement } = {}) {
     const documents = this.cache.explicit.filter(item => mentions(item.text, text)).map(item => `explicit-${item.id}`);
     this.cache.explicit = this.cache.explicit.filter(item => !mentions(item.text, text));
-    this.cache.tombstones.push({ id: randomUUID(), at, text, pending: true, documents, ...(replacement ? { replacement } : {}) });
+    this.cache.tombstones.push({ id: randomUUID(), at, text, pending: true, documents, traceIds: traceIds(), ...(replacement ? { replacement } : {}) });
     // Pending sources must obey the same deletion as the prompt and tool results.
     this.items = this.items.filter(item => !this.forgotten(item.text ?? [item.user, item.assistant, item.report].join('\n')));
     for (const batch of this.batches) {
@@ -453,29 +552,33 @@ export class ContextSystem extends EventEmitter {
     if (!this.bridge?.ready) return;
     for (const tombstone of this.cache.tombstones) {
       if (!tombstone.pending) continue;
-      const documents = new Set(tombstone.documents ?? []);
-      // Scan paginated source facts so Chinese BM25/recall limits cannot silently miss a matching document.
-      for (let offset = 0; ; offset += 100) {
-        const page = await this.bridge.listMemories({ limit: 100, offset, state: 'valid' }, { timeoutMs: 15_000 });
-        for (const fact of page.items ?? []) {
-          if (!this.matchesTombstone(fact.text, tombstone)) continue;
-          if (fact.document_id) documents.add(fact.document_id);
-          else if (fact.id && ['world', 'experience'].includes(fact.fact_type ?? fact.type)) await this.bridge.invalidateMemory(fact.id);
-        }
-        if (!(page.items?.length) || offset + page.items.length >= page.total) break;
-      }
-      for (const document of documents) {
-        this.traceEvent('memory.delete.request', { documentId: document, match: tombstone.text });
-        try { await this.bridge.deleteDocument(document); this.traceEvent('memory.delete.done', { documentId: document }); }
-        catch (error) { if (error.statusCode !== 404 && !/not found|404/i.test(error.message)) { this.traceEvent('memory.delete.failed', { documentId: document, error: error.message }); throw error; } }
-      }
-      tombstone.documents = [...documents];
-      // Deletions do not count as new writes in Hindsight; explicitly refresh stale derived models.
-      for (const model of MENTAL_MODELS) await this.bridge.refreshMentalModel(model.id);
-      tombstone.pending = false;
-      try { await this.saveCache({ durable: true }); }
-      catch (error) { tombstone.pending = true; throw error; }
+      const trace = createTrace('memory_delete', traceReferences([tombstone]));
+      await timed('context.memory.delete', () => this.applyDeletion(tombstone), { operationId: tombstone.id }, { trace });
     }
+  }
+  async applyDeletion(tombstone) {
+    const documents = new Set(tombstone.documents ?? []);
+    // Scan paginated source facts so Chinese BM25/recall limits cannot silently miss a matching document.
+    for (let offset = 0; ; offset += 100) {
+      const page = await this.bridge.listMemories({ limit: 100, offset, state: 'valid' }, { timeoutMs: 15_000 });
+      for (const fact of page.items ?? []) {
+        if (!this.matchesTombstone(fact.text, tombstone)) continue;
+        if (fact.document_id) documents.add(fact.document_id);
+        else if (fact.id && ['world', 'experience'].includes(fact.fact_type ?? fact.type)) await this.bridge.invalidateMemory(fact.id);
+      }
+      if (!(page.items?.length) || offset + page.items.length >= page.total) break;
+    }
+    for (const document of documents) {
+      this.traceEvent('memory.delete.request', { documentId: document, match: tombstone.text });
+      try { await this.bridge.deleteDocument(document); this.traceEvent('memory.delete.done', { documentId: document }); }
+      catch (error) { if (error.statusCode !== 404 && !/not found|404/i.test(error.message)) { this.traceEvent('memory.delete.failed', { documentId: document, error: error.message }); throw error; } }
+    }
+    tombstone.documents = [...documents];
+    // Deletions do not count as new writes in Hindsight; explicitly refresh stale derived models.
+    for (const model of MENTAL_MODELS) await this.bridge.refreshMentalModel(model.id);
+    tombstone.pending = false;
+    try { await this.saveCache({ durable: true }); }
+    catch (error) { tombstone.pending = true; throw error; }
   }
   matchesTombstone(value, item) {
     return mentions(value, item.text) && !(item.replacement && normalized(value).includes(normalized(item.replacement)));
@@ -491,13 +594,20 @@ export class ContextSystem extends EventEmitter {
 
   /** Pull the three mental models into RAM and data/memory-cache.json. */
   async refreshCache() {
+    return timed('context.cache_refresh', () => this.refreshCacheBody(), {}, {
+      trace: createTrace('memory_cache'), result: value => value ? 'ok' : 'deferred',
+    });
+  }
+  async refreshCacheBody() {
     await this.ready;
-    if (!this.bridge?.ready || this.closed) return false;
+    if (!this.bridge?.ready || this.closed || this.memoryPaused) return false;
+    const generation = this.memoryGeneration;
     this.traceEvent('cache.refresh.start', { models: MENTAL_MODELS.map(model => model.id) });
     const models = { ...this.cache.models };
     for (const model of MENTAL_MODELS) {
       try {
         const value = await this.bridge.mentalModel(model.id, model.responseSchema ? 'full' : 'content', { timeoutMs: 10_000 });
+        if (generation !== this.memoryGeneration || this.closed) return false;
         const structured = value.reflect_response?.structured_output;
         models[model.id] = {
           content: typeof value.content === 'string' ? value.content : '',
@@ -506,6 +616,7 @@ export class ContextSystem extends EventEmitter {
         };
         this.traceEvent('cache.model', { id: model.id, updatedAt: models[model.id].updatedAt, content: models[model.id].content, people: models[model.id].people });
       } catch (error) {
+        if (generation !== this.memoryGeneration || this.closed) return false;
         this.traceEvent('cache.model.failed', { id: model.id, error: error.message });
         if (error instanceof MemoryUnavailableError) return false;
       }
@@ -513,6 +624,7 @@ export class ContextSystem extends EventEmitter {
     this.cache.models = models;
     this.cache.fetchedAt = new Date(this.now()).toISOString();
     await this.saveCache();
+    if (generation !== this.memoryGeneration || this.closed) return false;
     this.traceEvent('cache.refresh.end', { fetchedAt: this.cache.fetchedAt });
     this.changed();
     return true;
@@ -590,34 +702,52 @@ export class ContextSystem extends EventEmitter {
 
   /** memory_search: recall with a hard timeout. Never throws. */
   async search(query, { signal } = {}) {
+    const unavailable = { available: false, results: [], note: CLEARING };
+    if (this.memoryPaused) return unavailable;
+    const generation = this.memoryGeneration;
     const text = String(query ?? '').trim();
-    this.traceEvent('memory.search.start', { query: text });
-    if (!text) { this.traceEvent('memory.search.end', { query: text, results: [], note: '查询为空' }); return { available: true, results: [], note: '查询为空' }; }
-    if (!this.bridge?.ready) { this.traceEvent('memory.search.unavailable', { query: text, status: this.service().status }); return { available: false, results: [], note: this.bridge ? '记忆服务不可用，只能依据注入的记忆和最近原话回答' : '记忆服务未启用' }; }
+    const timeoutMs = this.limits.searchTimeoutMs;
+    const started = performance.now();
+    this.traceEvent('memory.search.start', { query: text, timeoutMs });
+    if (!text) { this.traceEvent('memory.search.end', { query: text, results: [], note: '查询为空', elapsedMs: elapsed(started) }); return { available: true, results: [], note: '查询为空' }; }
+    if (!this.bridge?.ready) { this.traceEvent('memory.search.unavailable', { query: text, status: this.service().status, elapsedMs: elapsed(started) }); return { available: false, results: [], note: this.bridge ? '记忆服务不可用，只能依据注入的记忆和最近原话回答' : '记忆服务未启用' }; }
     try {
-      const found = await this.bridge.recall(text, { budget: 'mid', maxTokens: 2048 }, { timeoutMs: this.limits.searchTimeoutMs, signal });
+      const found = await this.bridge.recall(text, { budget: 'mid', maxTokens: 2048 }, { timeoutMs, signal });
+      if (generation !== this.memoryGeneration) return unavailable;
       const results = (found.results ?? []).filter(item => typeof item.text === 'string' && !this.forgotten(item.text)).slice(0, 12)
         .map(item => ({ text: item.text, type: item.type ?? undefined, when: item.occurred_start ?? item.mentioned_at ?? undefined }));
-      this.traceEvent('memory.search.end', { query: text, results });
+      this.traceEvent('memory.search.end', { query: text, results, elapsedMs: Math.round(performance.now() - started) });
       return { available: true, results };
     } catch (error) {
-      this.traceEvent('memory.search.failed', { query: text, error: error.message });
-      if (error.name === 'TimeoutError' || error.name === 'AbortError') return { available: true, results: [], note: '记忆检索超时，结果为空，可稍后重试或改用 memory_reflect' };
-      return { available: false, results: [], note: error instanceof MemoryUnavailableError ? error.message : `记忆检索失败：${error.message}` };
+      if (generation !== this.memoryGeneration) return unavailable;
+      const timedOut = error?.name === 'TimeoutError';
+      const cancelled = error?.name === 'AbortError' || (!timedOut && signal?.aborted && error === signal.reason);
+      const message = error?.message ?? String(error);
+      this.traceEvent('memory.search.failed', {
+        query: text, timeoutMs, outcome: cancelled ? 'cancelled' : timedOut ? 'timeout' : 'failed', elapsedMs: elapsed(started),
+        error: cancelled ? '记忆检索已取消' : message,
+      });
+      if (cancelled) return { available: true, results: [], note: '记忆检索已取消' };
+      if (timedOut) return { available: true, results: [], note: '记忆检索超时，结果为空，可稍后重试或改用 memory_reflect' };
+      return { available: false, results: [], note: error instanceof MemoryUnavailableError ? message : `记忆检索失败：${message}` };
     }
   }
   /** memory_reflect body, run by the Worker. Throws on failure so the Worker reports it. */
   async reflect(query, { signal } = {}) {
+    if (this.memoryPaused) throw new MemoryUnavailableError(CLEARING);
+    const generation = this.memoryGeneration;
     const text = String(query ?? '').trim();
     if (!text) throw new Error('查询为空');
+    const started = performance.now();
     this.traceEvent('memory.reflect.start', { query: text });
     if (!this.bridge?.ready) { this.traceEvent('memory.reflect.unavailable', { query: text, status: this.service().status }); throw new MemoryUnavailableError(this.bridge ? undefined : '记忆服务未启用'); }
     try {
       const answer = await this.bridge.reflect(text, { budget: 'mid' }, { timeoutMs: this.limits.reflectTimeoutMs, signal });
+      if (generation !== this.memoryGeneration) throw new MemoryUnavailableError(CLEARING);
       const result = { query: text, answer: this.scrub(answer.text ?? '').trim() || '记忆里没有相关内容。' };
-      this.traceEvent('memory.reflect.end', result);
+      this.traceEvent('memory.reflect.end', { ...result, elapsedMs: elapsed(started) });
       return result;
-    } catch (error) { this.traceEvent('memory.reflect.failed', { query: text, error: error.message }); throw error; }
+    } catch (error) { if (generation === this.memoryGeneration) this.traceEvent('memory.reflect.failed', { query: text, error: error.message, elapsedMs: elapsed(started), outcome: failure(error) }); throw error; }
   }
 
   async idle() {

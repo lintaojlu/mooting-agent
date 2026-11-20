@@ -1,3 +1,4 @@
+import { createTrace, elapsed, errorFields, log, timed } from '../log/index.mjs';
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { socketAllowed } from '../access.mjs';
@@ -18,12 +19,14 @@ export function mountSound2text(server, sound, { publicHosts = [], basePath = ''
   }
   server.on('upgrade', upgrade);
   wss.on('connection', socket => {
-    const id = randomUUID(); let chain = Promise.resolve(), active = false, queued = 0;
+    const trace = createTrace('audio_websocket');
+    const id = randomUUID();
+    log('info', 'voice.socket.open', { connectionId: id }, trace); let chain = Promise.resolve(), active = false, queued = 0, bytes = 0;
     const changed = state => send(socket, { type: 'state', state });
     sound.events.on('change', changed); send(socket, { type: 'state', state: sound.state() });
     socket.on('message', (data, binary) => {
       if (binary) {
-        try { if (!active) throw new Error('请先启动语音采集'); sound.pushAudio(data); }
+        try { if (!active) throw new Error('请先启动语音采集'); sound.pushAudio(data); bytes += data.length; }
         catch (error) { send(socket, { type: 'error', error: error.message }); }
         return;
       }
@@ -33,14 +36,15 @@ export function mountSound2text(server, sound, { publicHosts = [], basePath = ''
       if (message.type === 'cancel_capture') { sound.cancelCapture('语音采集已暂停，未完成指令已中止'); return; }
       if (queued >= 8) { send(socket, { type: 'error', error: '语音控制请求过多，请稍后再试' }); return; }
       queued++;
-      chain = chain.then(async () => {
+      const enqueued = performance.now();
+      chain = chain.then(() => timed('voice.socket.control', async () => {
         if (message.type === 'start') { await sound.start(id); active = true; if (socket.readyState !== WebSocket.OPEN) { active = false; await sound.pause('browser_disconnected'); return; } send(socket, { type: 'ready', state: sound.state() }); }
         else if (message.type === 'pause') { active = false; await sound.pause('user_pause'); send(socket, { type: 'ack', action: 'pause', state: sound.state() }); }
         else throw new Error('仅支持 start / pause，指令采集通过交互键协调');
-      }).catch(error => send(socket, { type: 'error', error: error.message })).finally(() => { queued--; });
+      }, { connectionId: id, queueMs: elapsed(enqueued), operation: ['start', 'pause'].includes(message.type) ? message.type : 'invalid' }, { trace })).catch(error => send(socket, { type: 'error', error: error.message })).finally(() => { queued--; });
     });
-    socket.on('error', () => {});
-    socket.on('close', () => { sound.events.off('change', changed); active = false; if (owner === socket) { owner = undefined; onOwner?.(socket.mootingUser, false); void chain.then(() => sound.pause('browser_disconnected')).catch(() => {}); } });
+    socket.on('error', error => log('error', 'voice.socket.error', { connectionId: id, ...errorFields(error) }, trace));
+    socket.on('close', () => { log('info', 'voice.socket.close', { connectionId: id, elapsedMs: elapsed(trace.started), bytes }, trace); sound.events.off('change', changed); active = false; if (owner === socket) { owner = undefined; onOwner?.(socket.mootingUser, false); void chain.then(() => sound.pause('browser_disconnected')).catch(() => {}); } });
   });
   return async function dispose() {
     closing = true; server.off('upgrade', upgrade);
