@@ -86,6 +86,7 @@ test('model settings API never exposes credentials and rejects cross-origin chan
 
 test('speaker card opens from the router tool and the close button adds no input', async t => {
   const { h, fixture } = await setup(t);
+  await h.runtime.socialCards.create({ name: 'John', position: '空间折叠负责人', company: '空间折叠', school: '', topic: '' }, 'vp-john');
   await h.runtime.configureModels({ router: { baseURL: fixture.baseURL, model: 'router-model' }, workerUsesRouter: true });
   await h.runtime.submit({ instruction: '识别面前说话人' }); await h.runtime.idle();
   const state = h.runtime.state();
@@ -93,7 +94,7 @@ test('speaker card opens from the router tool and the close button adds no input
   assert.equal(state.speaker.simulated, undefined);
   assert.equal(state.subtitle.active, false); assert.deepEqual(state.tasks, []);
   assert.ok(fixture.requests.every(request => request.tools?.length));
-  assert.ok(state.trace.some(event => event.type === 'router.answer' && event.data.text.includes('面前是John，空间折叠负责人；AI创业者。')));
+  assert.ok(state.trace.some(event => event.type === 'router.answer' && event.data.text.includes('面前是John，空间折叠负责人')));
   const inputs = state.trace.filter(event => event.type === 'interaction.submitted').length;
   assert.equal((await h.runtime.interrupt()).stopped, true); await h.runtime.idle();
   assert.equal(h.runtime.state().speaker.active, false); assert.equal(h.runtime.state().speaker.person, null);

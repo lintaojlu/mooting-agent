@@ -4,7 +4,7 @@ import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
-import { ContextSystem, composeUserPrompt, commandFromPrompt, memoryCommand, LIMITS, MEMORY_NOTE } from '../src/context/index.mjs';
+import { ContextSystem, commandFromPrompt, memoryCommand, LIMITS, MEMORY_NOTE } from '../src/context/index.mjs';
 import { loadHindsightConfig, HindsightBridge, publicServiceSettings } from '../src/context/hindsight.mjs';
 import { harness } from './harness.mjs';
 
@@ -24,8 +24,9 @@ test('a labeled speaker is stored as 名字：原文 and is not marked unconfirm
   await context.dispose();
 });
 
-test('composed prompt can recover the command', () => {
-  assert.equal(commandFromPrompt(composeUserPrompt('# 记忆', '现在的命令')), '现在的命令');
+test('command can be recovered from the router user message', () => {
+  const prompt = '## 最近1分钟原话\n背景\n\n## 用户指令\n```\n现在的命令\n```';
+  assert.equal(commandFromPrompt(prompt), '现在的命令');
   assert.equal(commandFromPrompt('直接的命令'), '直接的命令');
 });
 

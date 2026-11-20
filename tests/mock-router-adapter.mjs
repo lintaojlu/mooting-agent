@@ -25,15 +25,11 @@ export function scriptedInstruction(messages) {
   const raw = [...messages].reverse().find(message => message.role === 'user' && !memoryText(contentText(message)));
   const text = contentText(raw ?? {});
   try { const input = JSON.parse(text); if (typeof input.instruction === 'string') return input.instruction; } catch {}
-  if (text.includes('## 待提取指令')) {
-    const speech = text.split('## 待提取指令')[0].replace(/^## 最近1分钟原话[^\n]*\n/u, '').trim();
-    return speech.split(/(?<=[。！？!?])\s*|\n+/u).filter(Boolean).at(-1)?.trim() ?? '';
-  }
   return commandFromPrompt(text);
 }
 export function scriptedTool(instruction) {
   if (/关闭/.test(instruction) && /说话人|面前/.test(instruction)) return 'close_speaker';
-  if (/说话人|面前/.test(instruction)) return 'open_speaker';
+  if (/说话人|面前|社交卡片/.test(instruction)) return { name: 'social_card', arguments: { action: 'find' } };
   return undefined;
 }
 function continuation(result, instruction) {
@@ -60,8 +56,8 @@ export class MockRouterAdapter extends LlmAdapter {
       let result; try { result = JSON.parse(contentText(last)); } catch { result = {}; }
       chunks = continuation(result, instruction);
     } else {
-      const name = scriptedTool(instruction);
-      chunks = name ? toolChunks(name, {}) : textChunks(`模拟 Router 已处理：${instruction}`);
+      const tool = scriptedTool(instruction);
+      chunks = tool ? (typeof tool === 'string' ? toolChunks(tool, {}) : toolChunks(tool.name, tool.arguments ?? {})) : textChunks(`模拟 Router 已处理：${instruction}`);
     }
     for (const chunk of chunks) { options.signal?.throwIfAborted(); yield chunk; }
   }

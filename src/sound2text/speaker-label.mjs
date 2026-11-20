@@ -18,6 +18,12 @@ export function readSpeakerId(utterance) {
   return '';
 }
 
+/** Stable speaker id from ASR. Empty when the utterance has no speaker attribution. */
+export function readSpeakerKey(utterance) {
+  const raw = readSpeakerId(utterance);
+  return raw || '';
+}
+
 /** One spoken sentence. The label is the speaker; the text after the colon is what was said. */
 export function speakerLine(label, text) {
   const body = String(text ?? '').trim();

@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto';
 const demo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const checkout = path.resolve(demo, '../deepseek-harness');
 const vendor = path.join(demo, 'vendor');
-const roots = ['@deepseek-ai/dsh','@deepseek-ai/cordis','@deepseek-ai/dsh-agent','@deepseek-ai/dsh-agent-loop','@deepseek-ai/dsh-session','@deepseek-ai/dsh-system-prompt','@deepseek-ai/dsh-tools','@deepseek-ai/dsh-tool-executor-native','@deepseek-ai/dsh-session-projection','@deepseek-ai/dsh-llm'];
+const roots = ['@deepseek-ai/dsh','@deepseek-ai/cordis','@deepseek-ai/dsh-agent','@deepseek-ai/dsh-agent-loop','@deepseek-ai/dsh-session','@deepseek-ai/dsh-system-prompt','@deepseek-ai/dsh-tools','@deepseek-ai/dsh-tool-executor-native','@deepseek-ai/dsh-session-projection','@deepseek-ai/dsh-llm','@deepseek-ai/dsh-web','@deepseek-ai/dsh-web-deepseek-api','@deepseek-ai/dsh-web-fetch-http','@deepseek-ai/dsh-tool-web'];
 const queue = roots.map(name => ({ name, from: path.join(checkout,'apps/cli/package.json') }));
 const packages = new Map();
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -31,6 +31,14 @@ function assertTarget(p) {
 }
 async function resolvePackage(name,from) {
   if(name==='@deepseek-ai/dsh') return path.join(checkout,'apps/cli');
+  // Workspace packages outside the CLI dependency tree resolve by source path.
+  const local = {
+    '@deepseek-ai/dsh-web': 'packages/web/web',
+    '@deepseek-ai/dsh-web-deepseek-api': 'packages/web/web-deepseek-api',
+    '@deepseek-ai/dsh-web-fetch-http': 'packages/web/web-fetch-http',
+    '@deepseek-ai/dsh-tool-web': 'packages/web/tool-web',
+  }[name];
+  if(local) return path.join(checkout,local);
   const req=createRequire(from);
   let anchor=path.dirname(from);
   for(;;) {

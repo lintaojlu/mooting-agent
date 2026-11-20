@@ -89,11 +89,12 @@ try {
   assert.equal(await evaluate(`document.querySelector('#trace-title').textContent`), 'Agent Trace');
   // Desktop: Context is its own full-width row, below output/control/Router and above the trace.
   await cdp('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1100, deviceScaleFactor: 1, mobile: false });
-  const rows = await evaluate(`(() => { const box = id => { const r = document.getElementById(id).closest('section').getBoundingClientRect(); return { x:r.x, y:r.y, w:r.width, h:r.height }; }; const lab = document.querySelector('.lab-grid').getBoundingClientRect(); return { output:box('output-title'), stream:box('inform-stream-title'), router:box('agent-title'), context:box('context-title'), contextTrace:box('context-trace-title'), trace:box('trace-title'), labW:lab.width, streamTextH:document.getElementById('inform_stream').getBoundingClientRect().height, columns:[...document.querySelectorAll('.context-body > *')].map(e => e.getBoundingClientRect().top) }; })()`);
-  assert.ok(rows.stream.y >= rows.output.y && rows.router.y >= rows.stream.y + rows.stream.h - 1, '信息流必须位于 Router 上方');
-  assert.ok(rows.streamTextH <= 70, `信息流应更窄：${rows.streamTextH}`);
+  const rows = await evaluate(`(() => { const box = id => { const r = document.getElementById(id).closest('section').getBoundingClientRect(); return { x:r.x, y:r.y, w:r.width, h:r.height }; }; const lab = document.querySelector('.lab-grid').getBoundingClientRect(); return { output:box('output-title'), stream:box('inform-stream-title'), context:box('context-title'), contextTrace:box('context-trace-title'), trace:box('trace-title'), labW:lab.width, streamTextH:document.getElementById('inform_stream').getBoundingClientRect().height, columns:[...document.querySelectorAll('.context-body > *')].map(e => e.getBoundingClientRect().top), router:document.getElementById('agent-title') }; })()`);
+  assert.equal(rows.router, null, 'Router 面板已删除');
+  assert.ok(rows.stream.y >= rows.output.y && Math.abs((rows.stream.y + rows.stream.h) - (rows.output.y + rows.output.h)) <= 1, '信息流应占满原 Router 的高度并与输出底部对齐');
+  assert.ok(rows.streamTextH > 70, `信息流应占满剩余高度：${rows.streamTextH}`);
   assert.equal(rows.context.h, 0, 'Context 面板暂时隐藏');
-  assert.ok(rows.contextTrace.y >= Math.max(rows.output.y + rows.output.h, rows.router.y + rows.router.h) - 1, 'Context System Trace 应在输出与 Router 所在行之后');
+  assert.ok(rows.contextTrace.y >= rows.output.y + rows.output.h - 1, 'Context System Trace 应在输出与侧栏所在行之后');
   assert.ok(rows.trace.y >= rows.contextTrace.y + rows.contextTrace.h - 1, 'Agent Trace 应在 Context System Trace 之后');
   assert.equal(rows.columns.length, 2);
   assert.ok(rows.columns.every(top => Math.abs(top - rows.columns[0]) <= 1), '桌面宽度下 Context 两块内容应并排');

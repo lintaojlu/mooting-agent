@@ -15,17 +15,17 @@ export async function startModelFixture() {
     const user = [...value.input].reverse().find(item => item.role === 'user' && !memory(textOf(item)));
     let instruction = textOf(user);
     try { const parsed = JSON.parse(instruction); if (typeof parsed.instruction === 'string') instruction = parsed.instruction; } catch { instruction = commandFromPrompt(instruction); }
-    const toolName = /关闭/.test(instruction) && /说话人|面前/.test(instruction) ? 'close_speaker' : /说话人|面前/.test(instruction) ? 'open_speaker' : undefined;
+    const toolCall = /关闭/.test(instruction) && /说话人|面前/.test(instruction) ? { name: 'close_speaker', arguments: '{}' } : /说话人|面前|社交卡片/.test(instruction) ? { name: 'social_card', arguments: '{"action":"find"}' } : undefined;
     const n = requests.length; let output;
     const message = text => ({ type: 'message', id: `msg-${n}`, role: 'assistant', status: 'completed', content: [{ type: 'output_text', text, annotations: [] }] });
-    const call = name => ({ type: 'function_call', id: `fc-item-${n}`, call_id: `fixture-${n}`, name, arguments: '{}', status: 'completed' });
+    const call = (name, argumentsText = '{}') => ({ type: 'function_call', id: `fc-item-${n}`, call_id: `fixture-${n}`, name, arguments: argumentsText, status: 'completed' });
     if (!value.tools?.length) output = message(`测试模型接口已处理：${instruction}`);
     else if (last.type === 'function_call_output') {
       const result = JSON.parse(last.output);
       if (result.close_first) output = call(result.close_first);
-      else if (result.closed && !/关闭/.test(instruction) && toolName?.startsWith('open_')) output = call(toolName);
+      else if (result.closed && !/关闭/.test(instruction) && toolCall?.name?.startsWith('open_')) output = call(toolCall.name, toolCall.arguments);
       else output = message(result.say ?? result.error ?? '当前没有功能变化。');
-    } else output = toolName ? call(toolName) : message(`测试模型接口已处理：${instruction}`);
+    } else output = toolCall ? call(toolCall.name, toolCall.arguments) : message(`测试模型接口已处理：${instruction}`);
     const reasoning = { type: 'reasoning', id: `rs-${n}`, summary: [{ type: 'summary_text', text: '测试服务正在检查输入。' }], encrypted_content: `fixture-encrypted-${n}` };
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
     const send = event => res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);

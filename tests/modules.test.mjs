@@ -53,7 +53,7 @@ test('mock model emits the speaker tool and speaks the tool result', async () =>
   const adapter = new MockRouterAdapter();
   const first = await Array.fromAsync(adapter.stream({ messages: [{ role: 'user', content: [{ type: 'text', text: JSON.stringify({ instruction: '识别面前说话人' }) }] }] }));
   const call = first.find(e => e.type === 'block-end').block;
-  assert.equal(call.name, 'open_speaker'); assert.deepEqual(JSON.parse(call.arguments), {});
+  assert.equal(call.name, 'social_card'); assert.deepEqual(JSON.parse(call.arguments), { action: 'find' });
   const next = await Array.fromAsync(adapter.stream({ messages: [{ role: 'user', content: [{ type: 'text', text: '识别面前说话人' }] }, { role: 'tool', content: [{ type: 'text', text: JSON.stringify({ say: '面前是John，空间折叠负责人；AI创业者。' }) }] }] }));
   assert.equal(next.filter(e => e.type === 'text-delta').map(e => e.text).join(''), '面前是John，空间折叠负责人；AI创业者。');
 });

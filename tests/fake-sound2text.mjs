@@ -11,5 +11,8 @@ export class FakeSound2text {
   finishCapture() { this.update({ capture: { status: 'finishing' } }); }
   cancelCapture(reason) { this.update({ capture: { status: 'idle', reason } }); }
   commit(text) { this.update({ capture: { status: 'idle' } }); this.events.emit('instruction', { text, id: 'fixture-utterance' }); }
+  utterances(utterances) { this.update({ utterances }); this.events.emit('text', { text: this.value.text ?? '', utterances: structuredClone(utterances), audioMs: this.value.audioMs ?? 0 }); }
+  enrollmentClip() { return Buffer.alloc(0); }
+  voiceEndMs() { return this.value.audioMs ?? 0; }
   async pause() { this.cancelCapture('paused'); this.update({ status: 'stopped' }); }
 }

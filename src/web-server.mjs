@@ -102,6 +102,7 @@ export async function startWeb(runtime, { port = 4317, basePath = '', publicHost
         throw new InputError('请先登录', 401);
       }
       const username = access.auth ? access.sessionUser(req) : undefined;
+      runtime.buildAudioUrl = async clip => `${externalOrigin(req, decision, access)}/api/voiceprints/media/${hostedAudio.put(clip, 'audio/L16')}`;
       if (req.method === 'GET' && path === '/api/state') return json(res, 200, runtime.state(username));
       if (req.method === 'GET' && path === '/api/context/trace') return json(res, 200, await runtime.contextTrace(username));
       if (req.method === 'GET' && path === '/api/model/config') return json(res, 200, runtime.models?.state() ?? runtime.state(username).modelConfig);
@@ -142,9 +143,13 @@ export async function startWeb(runtime, { port = 4317, basePath = '', publicHost
         if (!req.headers['content-type']?.startsWith('application/json')) throw new InputError('Content-Type 必须为 application/json', 415);
         const input = await body(req);
         if (path === '/api/model/config') return json(res, 200, await runtime.configureModels(input));
+        if (path === '/api/social-card/create') return json(res, 200, await runtime.createSocialCard(input, username));
+        if (path === '/api/owner-speaker') return json(res, 200, runtime.setOwnerSpeaker(input?.name, username));
         if (path === '/api/submit') return json(res, 202, await runtime.submit(input, username));
         if (path === '/api/voice/interaction') return json(res, 200, await runtime.voiceInteraction({ ...input, username }));
         if (path === '/api/function/open') return json(res, 200, await runtime.showSpeaker(username));
+        if (path === '/api/social-card/save') return json(res, 200, await runtime.saveSocialCard(input, username));
+        if (path === '/api/social-card/discard') return json(res, 200, await runtime.discardSocialCard(username));
         if (path === '/api/interaction') return json(res, 200, await runtime.interrupt(username));
         if (path === '/api/subtitle/frame') { runtime.frame(input.text); return json(res, 200, { accepted: true }); }
       }

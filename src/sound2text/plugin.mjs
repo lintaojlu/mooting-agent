@@ -1,6 +1,6 @@
 import { Service } from '@deepseek-ai/cordis';
 import { Sound2Text } from './service.mjs';
-import { VoiceprintDirectory, VOICEPRINT_LIMIT } from './voiceprints.mjs';
+import { VoiceprintDirectory, VOICEPRINT_LIMIT, assertRegistrationAudio } from './voiceprints.mjs';
 
 /** Cordis-owned ASR lifecycle. Public service delegates to the independently testable engine. */
 export default class Sound2TextPlugin extends Service {
@@ -23,6 +23,14 @@ export default class Sound2TextPlugin extends Service {
     const apiKey = this.engine.config?.apiKey;
     if (!apiKey) throw Object.assign(new Error('请先填写 SOUND2TEXT_API_KEY'), { status: 409 });
     return new VoiceprintDirectory({ apiKey });
+  }
+  enrollmentClip(startMs, endMs) { return this.engine.enrollmentClip(startMs, endMs); }
+  voiceEndMs() { return this.engine.voiceEndMs(); }
+  /** Register a saved speaker from kept PCM. The hosted URL is supplied by the web layer. */
+  async registerFromPcm(name, clip, { audioUrl } = {}) {
+    assertRegistrationAudio(clip, 'card.pcm');
+    if (!audioUrl) throw Object.assign(new Error('声纹注册需要可下载的音频地址'), { status: 409 });
+    return this.voiceprints().register({ name, audioUrl });
   }
   async matchIds() {
     const items = await this.voiceprints().listAll();

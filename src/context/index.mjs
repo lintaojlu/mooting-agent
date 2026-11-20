@@ -17,15 +17,7 @@ export const MEMORY_NOTE = '记忆可能滞后，以最近原话为准；没有�
 const STREAM_CONTEXT = '现场对话，说话人未确认';
 const TURN_CONTEXT = 'MootingAgent 助手与用户对话';
 
-/** Join the memory snapshot and the current command into one prompt (kept for scripted test adapters). */
-export function composeUserPrompt(memory, command) {
-  const instruction = String(command ?? '').trim();
-  const snapshot = String(memory ?? '').trim();
-  if (!instruction) throw new Error('指令不能为空');
-  return `## 用户之前正在聊的内容\n\`\`\`\n${snapshot}\n\`\`\`\n\n## 用户指令\n\`\`\`\n${instruction}\n\`\`\``;
-}
-
-/** Recover the command from the instruction section. Text without that section is the command itself. */
+/** Recover the command from the Router user message. Text without that section is the command itself. */
 export function commandFromPrompt(prompt) {
   const text = String(prompt ?? '');
   const heading = text.lastIndexOf('## 用户指令');

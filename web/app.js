@@ -14,7 +14,8 @@
     if (!value || typeof value.sessionId !== 'string' || !['unconfigured', 'live', 'mock'].includes(value.mode) || typeof value.busy !== 'boolean' || !Array.isArray(value.events) || !Array.isArray(value.trace) || !Array.isArray(value.tasks) || !value.subtitle || typeof value.subtitle.active !== 'boolean' || typeof value.subtitle.text !== 'string') throw new Error('服务端状态不符合约定。');
     if (!value.context || typeof value.context.memory !== 'string' || typeof value.context.configured !== 'boolean' || !['idle', 'updating', 'error', 'unconfigured', 'disabled', 'starting', 'ready', 'offline'].includes(value.context.status)) throw new Error('Context 状态不符合约定。');
     if (value.context.fragments !== undefined && (!Array.isArray(value.context.fragments) || value.context.fragments.some(item => !item || typeof item.text !== 'string'))) throw new Error('Context 片段不符合约定。');
-    if (value.speaker && (typeof value.speaker.active !== 'boolean' || (value.speaker.active && value.speaker.person !== null && (!value.speaker.person || ['name', 'identity'].some(key => typeof value.speaker.person[key] !== 'string') || !Array.isArray(value.speaker.person.notes) || value.speaker.person.notes.some(note => typeof note !== 'string'))))) throw new Error('说话人状态不符合约定。');
+    if (value.speaker && (typeof value.speaker.active !== 'boolean' || (value.speaker.active && value.speaker.person !== null && (!value.speaker.person || typeof value.speaker.person.name !== 'string' || !Array.isArray(value.speaker.person.notes) || value.speaker.person.notes.some(note => typeof note !== 'string'))))) throw new Error('说话人状态不符合约定。');
+    if (typeof value.ownerSpeaker !== 'string' || !value.ownerSpeaker.trim()) throw new Error('主人显示名不符合约定。');
     validateConfig(value.modelConfig); return value;
   }
   function latestRouterAnswer(trace) {
@@ -32,29 +33,9 @@
     if (capture?.status === 'finishing') return { text: '正在等待语音识别完成…', error: false };
     return null;
   }
-  function limitChars(text, limit = 50) {
-    const value = String(text ?? '');
-    const chars = Array.from(value);
-    return chars.length > limit ? chars.slice(0, limit).join('') : value;
-  }
   function blockText(content) {
     if (!Array.isArray(content)) return '';
     return content.filter(block => block && block.type === 'text' && typeof block.text === 'string').map(block => block.text).join('').trim();
-  }
-  function limitAssistantEvents(events) {
-    return (events ?? []).map(event => {
-      if (event?.type !== 'assistant/message' && event?.type !== 'assistant/attempt') return event;
-      const message = event.data?.message;
-      if (!Array.isArray(message?.content)) return event;
-      let budget = 50;
-      const content = message.content.map(block => {
-        if (!block || block.type !== 'text' || typeof block.text !== 'string') return block;
-        const text = limitChars(block.text, budget);
-        budget -= Array.from(text).length;
-        return text === block.text ? block : { ...block, text };
-      });
-      return { ...event, data: { ...event.data, message: { ...message, content } } };
-    });
   }
   function instructionText(content) {
     const raw = blockText(content);
@@ -77,11 +58,11 @@
         // A finished background recall wakes the Router; show it as a status line, not as something the user said.
         turns.push({ role: 'status', text: '记忆回想完成' });
       } else if (event.type === 'assistant/message') {
-        const text = limitChars(blockText(data.message?.content));
+        const text = blockText(data.message?.content);
         if (text) turns.push({ role: 'assistant', text });
       }
     }
-    const partial = value.busy && typeof value.stream?.text === 'string' ? limitChars(value.stream.text) : '';
+    const partial = value.busy && typeof value.stream?.text === 'string' ? value.stream.text : '';
     if (partial) {
       const last = turns.at(-1);
       if (!(last?.role === 'assistant' && last.text === partial)) turns.push({ role: 'assistant', text: partial, streaming: true });
@@ -107,12 +88,35 @@
   function plainReply(text) {
     return String(text ?? '').replace(/\*\*/g, '');
   }
+  function agentPresence(open, phase, value) {
+    if (!open || !value) return { mode: 'hidden', text: '' };
+    const partial = value.busy ? plainReply(value.stream?.text ?? '') : '';
+    if (partial) return { mode: 'stream', text: partial };
+    if (phase === 'wait' || value.busy) return { mode: 'pending', text: value.busy ? '正在处理指令' : '已收到，正在处理' };
+    return { mode: 'card', text: '' };
+  }
+  function feedStream(queue, incoming) {
+    const target = plainReply(incoming);
+    const held = String(queue?.shown ?? '') + String(queue?.queued ?? '');
+    if (target.startsWith(held)) return { shown: String(queue?.shown ?? ''), queued: String(queue?.queued ?? '') + target.slice(held.length) };
+    return { shown: '', queued: target };
+  }
+  function drainStream(queue, count) {
+    const chars = Array.from(String(queue?.queued ?? ''));
+    const take = chars.slice(0, count).join('');
+    return { shown: String(queue?.shown ?? '') + take, queued: chars.slice(count).join('') };
+  }
+  function drainCount(queuedLength) {
+    if (queuedLength > 32) return 4;
+    if (queuedLength > 8) return 2;
+    return 1;
+  }
   function agentCard(value) {
-    const partial = value?.busy ? limitChars(plainReply(value?.stream?.text ?? '')) : '';
+    const partial = value?.busy ? plainReply(value?.stream?.text ?? '') : '';
     if (partial) return { text: partial, live: true };
     if (value?.busy) return { text: '正在处理指令', live: true };
     if (value?.lastError) return { text: '执行失败：' + value.lastError, live: false };
-    return { text: limitChars(plainReply(latestRouterAnswer(value?.trace))), live: false };
+    return { text: plainReply(latestRouterAnswer(value?.trace)), live: false };
   }
   function transcriptLines(text) {
     return String(text ?? '').split('\n').map(line => line.trim()).filter(Boolean);
@@ -206,7 +210,7 @@
     if (!audioState(value, localStatus).running) throw new Error('请先开启语音输入。');
     return { path: '/api/voice/interaction', body: {} };
   }
-  root.MootingUI = { captureFeedback, audioState, interactionRequest, submission, validateState, validateConfig, modelSubmission, latestRouterAnswer, routerDialogue, outputContent, functionPanel, mainCaption, lastSentence, agentCard, transcriptLines, commandPanel, contextPanel, memoryInfo, contextTraceSummary };
+  root.MootingUI = { captureFeedback, audioState, interactionRequest, submission, validateState, validateConfig, modelSubmission, latestRouterAnswer, routerDialogue, outputContent, functionPanel, mainCaption, lastSentence, agentPresence, feedStream, drainStream, drainCount, agentCard, transcriptLines, commandPanel, contextPanel, memoryInfo, contextTraceSummary };
   if (typeof document === 'undefined') return;
   openingIndex = Math.floor(Math.random() * OPENINGS.length);
   const $ = id => document.getElementById(id);
@@ -230,12 +234,21 @@
   function controls() {
     const configured = config?.configured === true || state?.mode === 'mock';
     const speakerActive = !!state?.speaker?.active, voice = audioState(state, localAudioStatus);
+    const draft = !!state?.speaker?.draft;
     const dictateBusy = dictating && voice.capturing === 'finishing';
     $('submit-button').disabled = !connected || dictateBusy || !configured || !voice.running || voice.busyAudio || voice.capturing === 'finishing';
     $('submit-button').setAttribute('aria-label', '右键');
-    $('close-agent').disabled = !connected || !agentOpen;
+    const agentLabel = agentOpen ? '关闭 agent 面板' : '打开 agent 面板';
     $('open-agent').disabled = !connected;
-    $('open-function').disabled = !connected || closing;
+    $('open-agent').textContent = agentLabel;
+    $('open-agent').setAttribute('aria-label', agentLabel);
+    $('open-agent').setAttribute('aria-pressed', String(agentOpen));
+    const functionOpen = speakerActive;
+    const functionLabel = functionOpen ? '关闭功能面板' : '打开功能面板';
+    $('open-function').disabled = !connected || closing || (functionOpen && draft);
+    $('open-function').textContent = functionLabel;
+    $('open-function').setAttribute('aria-label', functionLabel);
+    $('open-function').setAttribute('aria-pressed', String(functionOpen));
     $('save-model').disabled = saving || !!state?.busy;
     $('audio-toggle').disabled = !connected || localAudioStatus === 'stopping' || !audio;
     $('audio-toggle').setAttribute('aria-pressed', String(voice.active));
@@ -243,8 +256,9 @@
     $('audio-toggle').title = voice.active ? '暂停语音输入' : '开启语音输入';
     $('audio-toggle').querySelector('.play-symbol').toggleAttribute('hidden', voice.active);
     $('audio-toggle').querySelector('.pause-symbol').toggleAttribute('hidden', !voice.active);
-    $('esc-button').disabled = !connected || closing || !speakerActive;
-    $('esc-button').setAttribute('aria-label', '关闭功能面板');
+    const name = String($('speaker-name-input')?.value ?? '').trim();
+    $('save-social-card').disabled = !connected || closing || !draft || !name;
+    $('discard-social-card').disabled = !connected || closing || !draft;
     $('inform_stream').readOnly = true;
     const text = state?.sound2text?.text;
     if (typeof text === 'string' && $('inform_stream').value !== text.slice(-12000)) {
@@ -348,35 +362,85 @@
       return row;
     }));
   }
-  function paintAgent(text, live) {
+  function paintAgent(text) {
     const node = $('output-text');
-    node.replaceChildren();
-    const body = document.createElement('p');
-    body.className = 'output-turn-body' + (live ? ' thinking' : '');
-    body.textContent = plainReply(text);
-    node.append(body);
-    node.classList.remove('thinking');
+    let body = node.querySelector('.output-turn-body');
+    if (!body) {
+      node.replaceChildren();
+      body = document.createElement('p');
+      body.className = 'output-turn-body';
+      node.append(body);
+    }
+    const value = plainReply(text);
+    if (body.textContent !== value) body.textContent = value;
+    node.scrollTop = node.scrollHeight;
+    requestAnimationFrame(() => { if (node.isConnected) node.scrollTop = node.scrollHeight; });
+  }
+  let streamShown = '';
+  let streamQueued = '';
+  let streamTimer = null;
+  function stopStream() {
+    if (streamTimer) clearTimeout(streamTimer);
+    streamTimer = null;
+  }
+  function resetStream() {
+    stopStream();
+    streamShown = '';
+    streamQueued = '';
+  }
+  function pumpStream() {
+    if (!streamQueued) { streamTimer = null; return; }
+    const motion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    const count = motion ? Array.from(streamQueued).length : drainCount(Array.from(streamQueued).length);
+    const next = drainStream({ shown: streamShown, queued: streamQueued }, count);
+    streamShown = next.shown;
+    streamQueued = next.queued;
+    paintAgent(streamShown);
+    streamTimer = streamQueued ? setTimeout(pumpStream, 32) : null;
+  }
+  function pushStream(target) {
+    const next = feedStream({ shown: streamShown, queued: streamQueued }, target);
+    streamShown = next.shown;
+    streamQueued = next.queued;
+    if (!streamTimer && streamQueued) pumpStream();
+  }
+  function revealAgent(text) {
+    resetStream();
+    streamShown = plainReply(text);
+    paintAgent(streamShown);
   }
   function renderAgent() {
+    const presence = agentPresence(agentOpen, agentPhase, state);
     $('output-stage').classList.toggle('is-agent', agentOpen);
     $('agent-panel').setAttribute('aria-hidden', String(!agentOpen));
-    if (!agentOpen || !state) return;
-    if (agentPhase === 'wait' || state.busy) {
-      if (state.busy) agentPhase = 'live';
-      const card = state.busy ? agentCard(state) : { text: '正在处理指令', live: true };
-      paintAgent(card.text, card.live);
+    const showCard = presence.mode === 'card' || presence.mode === 'stream';
+    $('agent-pending').hidden = presence.mode !== 'pending';
+    $('interaction-window').hidden = !showCard;
+    if (presence.mode === 'hidden' || presence.mode === 'pending') {
+      resetStream();
+      if (presence.mode === 'pending') {
+        if (state.busy) agentPhase = 'live';
+        $('agent-pending-text').textContent = presence.text;
+      }
       return;
     }
+    if (presence.mode === 'stream') {
+      if (state.busy) agentPhase = 'live';
+      pushStream(presence.text);
+      return;
+    }
+    const finishing = agentPhase === 'live' || streamQueued || streamTimer;
     if (agentPhase === 'live') agentPhase = 'idle';
-    paintAgent(agentCard(state).text, false);
+    if (finishing) pushStream(agentCard(state).text);
+    else revealAgent(agentCard(state).text);
   }
   function followScrollports() {
+    bindTailFollow($('main-column'));
     bindTailFollow($('interaction-window'));
     bindTailFollow($('main-panel'));
     bindTailFollow($('function-window'));
     bindTailFollow($('context-snapshot'));
     bindTailFollow($('context-trace-view'));
-    bindTailFollow($('agent-conversation'));
     const pane = $('trajectory-view')?.querySelector('[data-trajectory-scroll]');
     if (pane === trajectoryPane) return;
     trajectoryPane?.__tailFollow?.disconnect();
@@ -385,13 +449,12 @@
   }
   function renderViews() {
     const views = root.MootingDSHViews;
-    if (!views || typeof views.renderConversation !== 'function' || typeof views.renderTrajectory !== 'function') {
-      $('views-error').textContent = 'DSH 对话与轨迹组件未加载。可展开原始事件查看数据；请检查 /dsh-views.js 和 /dsh-views.css。';
+    if (!views || typeof views.renderTrajectory !== 'function') {
+      $('views-error').textContent = 'DSH 轨迹组件未加载。可展开原始事件查看数据；请检查 /dsh-views.js 和 /dsh-views.css。';
       $('views-error').hidden = false; followScrollports(); return;
     }
     try {
-      const stream = state.stream ? { ...state.stream, text: limitChars(state.stream.text ?? '') } : state.stream;
-      views.renderConversation($('agent-conversation'), { events: limitAssistantEvents(state.events), stream, busy: state.busy });
+      const stream = state.stream;
       views.renderTrajectory($('trajectory-view'), { events: state.events, stream, busy: state.busy });
       $('views-error').hidden = true;
     } catch (error) { $('views-error').textContent = 'DSH 组件渲染失败：' + error.message; $('views-error').hidden = false; }
@@ -399,7 +462,6 @@
   }
   function applyState(value) {
     state = validateState(value); displayConfig(state.modelConfig, !configLoaded);
-    $('agent-status').textContent = state.busy ? '执行中' : state.reflecting > 0 ? '回想中' : state.events.length ? '已结束本轮' : '等待输入';
     const memory = contextPanel(state);
     $('context-snapshot').textContent = memory.text;
     $('context-injected').textContent = memory.injected;
@@ -420,8 +482,7 @@
     $('speaker-card').hidden = !speakerActive;
     const person = state.speaker?.person;
     $('speaker-card-title').textContent = '社交卡片';
-    $('speaker-name').textContent = person?.name ?? '正在识别…';
-    $('speaker-identity').textContent = person?.identity ?? '—';
+    renderSpeakerCard(person, !!state.speaker?.draft, state.speaker?.error);
     if (speakerActive) $('function-window').scrollTop = 0;
     renderSpeakerNotes(person?.notes);
     const feedback = captureFeedback(state);
@@ -433,7 +494,36 @@
     } else if (state.sound2text?.capture?.status === 'listening' && lastCaptureError) { lastCaptureError = ''; notice(''); }
     if (state.sound2text?.error && state.sound2text.error !== lastSoundError) { lastSoundError = state.sound2text.error; notice(lastSoundError, true); }
     else if (state.sound2text?.voiceprintNotice && state.sound2text.voiceprintNotice !== lastVoiceprintNotice) { lastVoiceprintNotice = state.sound2text.voiceprintNotice; notice(lastVoiceprintNotice, false); }
+    const ownerInput = $('owner-speaker');
+    if (ownerInput && document.activeElement !== ownerInput) ownerInput.value = state.ownerSpeaker;
     renderViews(); controls();
+  }
+  function renderSpeakerCard(person, draft, error) {
+    const value = key => String(person?.[key] ?? '');
+    const fields = { name: value('name'), position: value('position'), company: value('company'), school: value('school'), mbti: value('mbti'), topic: value('topic'), savedAt: value('savedAt') };
+    const show = (id, text) => { const node = $(id); if (node) node.textContent = text || '—'; };
+    const fill = (id, text) => { const node = $(id); if (node && document.activeElement !== node) node.value = text; };
+    show('speaker-name', fields.name || (draft ? '' : '正在识别…'));
+    show('speaker-position', fields.position);
+    show('speaker-company', fields.company);
+    show('speaker-school', fields.school);
+    show('speaker-mbti', fields.mbti);
+    show('speaker-topic', fields.topic);
+    show('speaker-saved', fields.savedAt ? new Date(fields.savedAt).toLocaleString('zh-CN', { hour12: false }) : '');
+    fill('speaker-name-input', fields.name);
+    fill('speaker-position-input', fields.position);
+    fill('speaker-company-input', fields.company);
+    fill('speaker-school-input', fields.school);
+    fill('speaker-mbti-input', fields.mbti);
+    fill('speaker-topic-input', fields.topic);
+    for (const key of ['name', 'position', 'company', 'school', 'mbti', 'topic']) {
+      $(`speaker-${key}`).hidden = draft;
+      $(`speaker-${key}-input`).hidden = !draft;
+    }
+    $('speaker-saved').hidden = draft;
+    const warning = $('speaker-error');
+    warning.textContent = error || '';
+    warning.hidden = !error;
   }
   function renderSpeakerNotes(notes) {
     const target = $('speaker-notes');
@@ -504,6 +594,14 @@
   });
   $('close-settings').addEventListener('click', () => $('model-settings').close());
   $('model-form').addEventListener('input', () => { formDirty = true; });
+  $('owner-speaker-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    try {
+      const result = await request('/api/owner-speaker', { name: $('owner-speaker').value });
+      if (state) state.ownerSpeaker = result.ownerSpeaker;
+      notice('主人显示名已保存');
+    } catch (error) { notice(error.message, true); }
+  });
   $('model-form').addEventListener('submit', async event => {
     event.preventDefault(); if (saving || state?.busy) return;
     try {
@@ -527,22 +625,25 @@
       if (result?.skipped) { agentOpen = false; agentPhase = 'idle'; }
       else if (agentPhase === 'wait' && !state?.busy) agentPhase = 'idle';
       renderAgent(); controls();
-    } catch (error) { agentPhase = 'idle'; notice(error.message, true); if (agentOpen) paintAgent(error.message, false); }
+    } catch (error) {
+      agentPhase = 'idle'; notice(error.message, true);
+      if (agentOpen) { $('agent-pending').hidden = true; $('interaction-window').hidden = false; revealAgent(error.message); }
+    }
     finally { dictating = false; controls(); }
   }
   $('submit-form').addEventListener('submit', event => {
     event.preventDefault(); if ($('submit-button').disabled) return;
     confirmChain = confirmChain.then(sendConfirm, sendConfirm);
   });
-  $('close-agent').addEventListener('click', () => {
-    agentOpen = false; agentPhase = 'idle'; renderAgent(); controls();
-  });
   $('open-agent').addEventListener('click', () => {
     if ($('open-agent').disabled) return;
-    agentOpen = true; if (!state?.busy) agentPhase = 'idle'; renderAgent(); controls();
+    agentOpen = !agentOpen;
+    if (!agentOpen || !state?.busy) agentPhase = 'idle';
+    renderAgent(); controls();
   });
   $('open-function').addEventListener('click', async () => {
     if ($('open-function').disabled) return;
+    if (state?.speaker?.active) { await closeFunction(); return; }
     try {
       closing = true; controls(); notice('');
       await request('/api/function/open', {});
@@ -551,7 +652,7 @@
     finally { closing = false; controls(); }
   });
   async function closeFunction() {
-    if ($('esc-button').disabled || !state?.speaker?.active) return;
+    if ($('open-function').disabled || !state?.speaker?.active) return;
     try {
       closing = true; controls(); notice('');
       await request('/api/interaction', {});
@@ -559,10 +660,29 @@
     } catch (error) { notice(error.message, true); }
     finally { closing = false; controls(); }
   }
-  $('esc-button').addEventListener('click', () => { closeFunction(); });
+  async function decideSocialCard(save) {
+    if ($('save-social-card').disabled && $('discard-social-card').disabled) return;
+    try {
+      closing = true; controls(); notice('');
+      const body = save ? {
+        name: $('speaker-name-input').value,
+        position: $('speaker-position-input').value,
+        company: $('speaker-company-input').value,
+        school: $('speaker-school-input').value,
+        mbti: $('speaker-mbti-input').value,
+        topic: $('speaker-topic-input').value,
+      } : {};
+      await request(save ? '/api/social-card/save' : '/api/social-card/discard', body);
+      applyState(await request('/api/state'));
+    } catch (error) { notice(error.message, true); }
+    finally { closing = false; controls(); }
+  }
+  $('save-social-card').addEventListener('click', () => { decideSocialCard(true); });
+  $('discard-social-card').addEventListener('click', () => { decideSocialCard(false); });
+  for (const id of ['speaker-name-input', 'speaker-position-input', 'speaker-company-input', 'speaker-school-input', 'speaker-mbti-input', 'speaker-topic-input']) $(id).addEventListener('input', controls);
   document.addEventListener('keydown', event => {
     if (event.key !== 'Escape' || event.repeat || $('model-settings').open) return;
-    if ($('esc-button').disabled) return;
+    if ($('open-function').disabled || !state?.speaker?.active) return;
     event.preventDefault();
     closeFunction();
   });
@@ -577,6 +697,6 @@
       applyState(await request('/api/state'));
     } catch (error) { notice(error.message, true); controls(); }
   });
-  window.addEventListener('beforeunload', () => { clearInterval(clockTimer); source?.close(); audio?.pause(); });
+  window.addEventListener('beforeunload', () => { clearInterval(clockTimer); stopStream(); source?.close(); audio?.pause(); });
   controls(); connect();
 })(globalThis);
